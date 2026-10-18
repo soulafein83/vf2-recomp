@@ -5,3 +5,5 @@ build/
 local.properties
 *.iml
 .idea/
+# device logs pulled off the phone (adb logcat > ...)
+*.logcat

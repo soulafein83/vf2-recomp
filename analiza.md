@@ -2,7 +2,7 @@
 
 Data: 2026-10-18. **Tylko analiza** — żadnego pliku projektu nie zmieniono.
 Metoda: każde twierdzenie z obu notatek sprawdzone w kodzie tego repozytorium (odnośniki `plik:linia`)
-i w pomiarach z `log.txt` (piąty przebieg na telefonie). Nie zgaduję — co dało się sprawdzić, jest sprawdzone;
+i w pomiarach z piątego przebiegu na telefonie. Nie zgaduję — co dało się sprawdzić, jest sprawdzone;
 co się nie dało, jest nazwane „niezweryfikowane".
 
 Legenda:
@@ -56,7 +56,7 @@ które jest całkowicie słuszne i które koryguje moją własną wcześniejszą
 
 | Recepta | Ocena | Dlaczego |
 |---|---|---|
-| `SDL_SetHint(SDL_HINT_RENDER_DRIVER, "vulkan")` | 🔴 | Dwa błędy naraz. (1) Hint jest czytany **tylko wtedy, gdy nazwy renderera nie podano** (`SDL_render.c:1107-1109`), a nasz kod podaje nazwę jawnie: `SDL_CreateRenderer(win, "gpu")` (`src/host/main.cpp:1166`) — czyli hint i tak nic nie zrobi. (2) Gdyby go posłuchać i przełączyć na „auto", `"vulkan"` to **inny, stary renderer** (`SDL_render_vulkan.c:4648: VULKAN_CreateRenderer, "vulkan"`), a nie backend Vulkan w SDL_GPU. Backend Vulkan w rendererze `gpu` wybiera się przez `SDL_HINT_GPU_DRIVER` / `SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING` (`SDL_render_gpu.c:1734`) — i nasz kod już to robi w ścieżce awaryjnej (`main.cpp:1164, 1214`). Na Androidzie i tak domyślnie mamy Vulkan: log `SDL_GPU: vulkan, Mali-G720-Immortalis MC12` (`log.txt:7`). |
+| `SDL_SetHint(SDL_HINT_RENDER_DRIVER, "vulkan")` | 🔴 | Dwa błędy naraz. (1) Hint jest czytany **tylko wtedy, gdy nazwy renderera nie podano** (`SDL_render.c:1107-1109`), a nasz kod podaje nazwę jawnie: `SDL_CreateRenderer(win, "gpu")` (`src/host/main.cpp:1166`) — czyli hint i tak nic nie zrobi. (2) Gdyby go posłuchać i przełączyć na „auto", `"vulkan"` to **inny, stary renderer** (`SDL_render_vulkan.c:4648: VULKAN_CreateRenderer, "vulkan"`), a nie backend Vulkan w SDL_GPU. Backend Vulkan w rendererze `gpu` wybiera się przez `SDL_HINT_GPU_DRIVER` / `SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING` (`SDL_render_gpu.c:1734`) — i nasz kod już to robi w ścieżce awaryjnej (`main.cpp:1164, 1214`). Na Androidzie i tak domyślnie mamy Vulkan: log `SDL_GPU: vulkan, Mali-G720-Immortalis MC12`. |
 | `SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0")` | 🟡 | Hint istnieje (`SDL_hints.h:3386`) i ustawia **domyślną** wartość vsync dla nowo tworzonych rendererów (`SDL_render.c:1090-1092`). My ustawiamy vsync świadomie, przez `SDL_SetRenderVSync` w `apply_display_settings()` (`main.cpp:1247-1254`), bo to ustawienie gracza. Hint tylko by z tym walczył — a „wyłączenie vsync na sztywno" jest sprzeczne z tym, o co prosił gracz. |
 | `SDL_SetHint(SDL_HINT_VIDEO_DOUBLE_BUFFER, "1")` | 🟡 | **No-op na Androidzie.** Ten hint czyta wyłącznie czwórka plików `kmsdrm`/`raspberry`/`wayland` w `third_party/sdl3/src/video/`, nic w ścieżce GPU/Vulkan. |
 | `uses-feature android.hardware.vulkan.version … required="true"` + `android:version="0x00403000"` | 🟡→🔴 | **Mamy już to w manifeście, ale z `required="false"`** (`android/app/src/main/AndroidManifest.xml:22-23`) — i to jest poprawne, bo projekt ma świadomą ścieżkę awaryjną na CPU (tryb Auto potrafi zejść na CPU; renderer `opengl`/`software` też istnieje). `required="true"` zablokowałoby instalację na sprzęcie bez Vulkan 1.3 i **zaprzeczyłoby własnemu projektowi**. Dopisanie `android:version="0x00403000"` byłoby tylko informacyjne (filtr w sklepie), bo przy `required="false"` niczego nie wymusza. `0x00403000` = Vulkan 1.3 — poprawnie zakodowane. |
@@ -105,7 +105,7 @@ które w tym repo **już są**, co samo w sobie jest dobrą wiadomością: nieza
 |---|---|---|
 | „W SPIR-V oznaczaj wyniki `NoContraction` (w HLSL `precise`)" | ✅ | **Zrobione i udokumentowane w repo.** `src/gpu/gpu3d.hlsl` używa `precise` 44 razy, a `tools/gpu/shaders.sh` tłumaczy nawet dlaczego nie ma tam flagi `-Gis` dla SPIR-V: „IEEE strictness, for DXIL: SPIR-V's would need Vulkan 1.2; `precise` does it there". |
 | „Unikaj `RelaxedPrecision` (mediump), bo Mali liczy wtedy w fp16" | ✅ **i korekta mojej notatki** | To prawda i to **obowiązuje**. Ścieżka SDL_GPU jest **zawsze „exact"**: `gpu3d_sdlgpu.cpp:120-121` — `set_quality()` jest puste („the exact way only"), więc `gpu_quality`/`VF2_GPU3D_FAST` jej nie dotyczy. Moja wcześniejsza sugestia z `docs/ARM-IMMORTALIS-G720.md` („try fp16 in the GPU 3D compute shader") była **błędna dla trybu exact** i należy ją wykreślić: fp16 łamie bit-dokładność, a sprawdzenie przy starcie odrzuci taki obraz. |
-| „Konwersja float→int poza zakresem na ARM daje inny wynik niż x86" | ✅/⚪ | Kierunek prawdziwy, ale u nas złagodzony: weryfikacja akceptuje różnice **zaokrągleń** i tak też wypada w praktyce — `log.txt:13`: „1 z 3304 x 1536 pikseli różni się o zaokrąglenie, kolory najwyżej o 5; zachowujemy GPU". |
+| „Konwersja float→int poza zakresem na ARM daje inny wynik niż x86" | ✅/⚪ | Kierunek prawdziwy, ale u nas złagodzony: weryfikacja akceptuje różnice **zaokrągleń** i tak też wypada w praktyce — piąty przebieg: „1 z 3304 x 1536 pikseli różni się o zaokrąglenie, kolory najwyżej o 5; zachowujemy GPU". |
 | „Jeśli test się nie zgodzi, gra **po cichu** spadnie na CPU, bez komunikatu" | 🟡 | Połowicznie. W interfejsie gracz rzeczywiście nie dostaje komunikatu, ale **log mówi wszystko**: linia `the 3D (...) … : on the CPU/GPU` (`main.cpp:1791`), „keeping the GPU" (`1755`), powód w `render state (…)`. To nie „cicho", to „w logu". Jeśli kiedyś chcemy komunikat na ekranie, to drobiazg — ale nie usterka. |
 | Zalecenie końcowe: „Zacznij od trybu CPU, GPU dopiero po rozwiązaniu problemu z FMA" | 🟡 | Dla **tego** projektu nadgorliwe: problem FMA jest rozwiązany (`precise` + test + fallback), a Auto sam wybiera. W praktyce CPU i tak wygrywa od 4x w górę, więc rada „zbliżona do prawdy", ale nie z powodu FMA. |
 
@@ -121,7 +121,7 @@ które w tym repo **już są**, co samo w sobie jest dobrą wiadomością: nieza
 
 | Recepta | Ocena | Dlaczego |
 |---|---|---|
-| „Zapisuj `VkPipelineCache` na dysk" | 🟡 | **Nie da się przez SDL_GPU** — `SDL_gpu.h` nie ma żadnego API pipeline cache (sprawdzone: brak wystąpień). Pipeline'y tworzymy raz, na starcie: „its pipelines ready in 294 ms" (`log.txt:10`) — to jednorazowy koszt startu, a sterowniki Mali mają własny dyskowy cache shaderów. |
+| „Zapisuj `VkPipelineCache` na dysk" | 🟡 | **Nie da się przez SDL_GPU** — `SDL_gpu.h` nie ma żadnego API pipeline cache (sprawdzone: brak wystąpień). Pipeline'y tworzymy raz, na starcie: „its pipelines ready in 294 ms" — to jednorazowy koszt startu, a sterowniki Mali mają własny dyskowy cache shaderów. |
 | „Użyj Swappy (Android Frame Pacing)" | 🟡 | Swappy opakowuje **własny swapchain Vulkan** — nie da się go wpiąć pod SDL_GPU bez porzucenia SDL_GPU. Do tego byłoby to sprzeczne z projektem: emulator celowo idzie własnym rytmem 57,52 Hz (tempo automatów), a nie tempem ekranu. Cel (stabilne klatkowanie) jest realny, ale realizujemy go przez vsync/present mode/governor, nie przez Swappy. |
 | „Dodaj Android Performance Hint API" | 🔵 | **Trafione i niezrobione.** To dokładnie API `android/performance_hint.h` z NDK (ADPF), „intended for periodic workloads, such as frame production" — czyli nasza klatka 17,4 ms. SDL tego **nie używa** (sprawdzone: brak w `third_party/sdl3/src/`), a `sysinfo::tune()` na Androidzie nic nie robi. To jest właściwa odpowiedź na „telefon dławi taktowanie" z obu notatek. Szczegóły — §3.1. |
 | „Przypnij wątki emulacji do X4" | 🔵 | Niezrobione (patrz §2.2). Wątpliwość: Android i tak zarządza cpusetem i może to nadpisać. Eksperyment, nie oczywisty zysk — §3.3. |
@@ -171,7 +171,7 @@ Dopiero po tym warto rozważać dodanie odczytu zegarów GPU do bloku `pace:` w 
 - Dziś: brak (`sysinfo::tune()` to `_WIN32`; `main.cpp:932`).
 - Na Androidzie: `sched_setaffinity` na zbiór rdzeni X4 dla wątków roboczych. Ryzyko: scheduler Androida
   i cpuset mogą to ignorować albo karać (gorący klaster), a przy 7 wątkach przypięcie do 1–2 rdzeni może
-  **zaszkodzić** — 3D na CPU używa 7 wątków i skaluje się dobrze (`log.txt:14`: 21,09 ms).
+  **zaszkodzić** — 3D na CPU używa 7 wątków i skaluje się dobrze (w piątym przebiegu: 21,09 ms).
 - Wniosek: próbować tylko po §3.2 i tylko jako ustawienie do wyłączenia (`VF2_AFFINITY=1`), z pomiarem.
 
 ### 3.4 🟡 Higiena dokumentów (nie kod)
