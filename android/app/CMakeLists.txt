@@ -1,0 +1,115 @@
+# Android (NDK/CMake) build of Virtua Fighter 2 Recomp.
+# Mirrors the top-level Makefile's source lists and flags; produces libmain.so
+# (the game, linked against libSDL3.so) for arm64-v8a.
+cmake_minimum_required(VERSION 3.22)
+project(vf2 LANGUAGES C CXX)
+
+# The debug APK is the one that gets installed, and CMake's Debug type is -O0: the recompiled
+# i960, the board, the CPU's 3D and SDL's own renderer then run at a fraction of their speed (on a
+# Dimensity 9300+ the board's frame cost fell from ~20 ms to the game's own 17.4 ms budget once
+# this was -O2). Keep -g, add -O2, here so the dependencies (SDL3, FreeType) get it too.
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O2")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O2")
+
+# android/app -> the repository root
+set(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
+get_filename_component(REPO_ROOT "${REPO_ROOT}" ABSOLUTE)
+
+# ---------------------------------------------------------------- dependencies
+# SDL3 (shared: libSDL3.so, loaded by the SDLActivity Java side).
+set(SDL_SHARED ON  CACHE BOOL "" FORCE)
+set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory("${REPO_ROOT}/third_party/sdl3" "${CMAKE_BINARY_DIR}/sdl3")
+
+# FreeType (static; RmlUi's font engine). zlib comes from the NDK sysroot.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(FT_DISABLE_BZIP2 TRUE CACHE BOOL "" FORCE)
+set(FT_DISABLE_PNG TRUE CACHE BOOL "" FORCE)
+set(FT_DISABLE_HARFBUZZ TRUE CACHE BOOL "" FORCE)
+set(FT_DISABLE_BROTLI TRUE CACHE BOOL "" FORCE)
+add_subdirectory("${REPO_ROOT}/third_party/freetype" "${CMAKE_BINARY_DIR}/freetype")
+
+# SLJIT (BSD-2): the i960's native code, made at start-up (mirrors the Makefile).
+add_library(sljit STATIC "${REPO_ROOT}/third_party/sljit/sljitLir.c")
+target_compile_definitions(sljit PRIVATE SLJIT_CONFIG_AUTO=1)
+target_compile_options(sljit PRIVATE -w -O2)
+
+# ------------------------------------------------------------------- version.h
+execute_process(COMMAND git describe --tags --always
+    WORKING_DIRECTORY "${REPO_ROOT}"
+    OUTPUT_VARIABLE VF2_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT VF2_VERSION)
+    set(VF2_VERSION "dev")
+endif()
+execute_process(COMMAND git log -1 --format=%cd --date=short
+    WORKING_DIRECTORY "${REPO_ROOT}"
+    OUTPUT_VARIABLE VF2_DATE OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT VF2_DATE)
+    set(VF2_DATE "unknown")
+endif()
+configure_file("${CMAKE_CURRENT_LIST_DIR}/version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/version.h" @ONLY)
+
+# ------------------------------------------------------------- the game's code
+set(VF2_APP
+    src/host/main.cpp src/host/menu.cpp src/host/sysinfo.cpp
+    src/host/d3d11_map.cpp src/host/stb_image_impl.cpp
+    src/rec/gen_none.cpp
+    src/gpu/gpu3d_sdlgpu.cpp)                 # SDL_GPU (Vulkan on Android)
+set(VF2_MACHINE
+    src/machine/model2a.cpp src/machine/model2_video.cpp
+    src/machine/model2_smooth.cpp src/machine/scsp.cpp src/machine/scspdsp.cpp)
+set(VF2_HOST
+    src/host/romset.cpp src/host/input_script.cpp)
+set(VF2_CORE
+    third_party/mame/i960/i960.cpp third_party/mame/i960/i960dis.cpp
+    src/core/mame_shim.cpp src/core/mb86233.cpp src/core/i960_device.cpp
+    src/rec/i960_rec.cpp src/rec/i960_analyse.cpp
+    src/rec/i960_native.cpp src/rec/vf2_map.cpp)
+set(VF2_M68000
+    third_party/mame/m68000/m68000.cpp third_party/mame/m68000/m68000-decode.cpp
+    third_party/mame/m68000/m68000-sdf.cpp third_party/mame/m68000/m68000-sdp.cpp)
+file(GLOB VF2_RML
+    "${REPO_ROOT}/third_party/rmlui/Source/Core/*.cpp"
+    "${REPO_ROOT}/third_party/rmlui/Source/Core/*/*.cpp")
+list(APPEND VF2_RML
+    "${REPO_ROOT}/third_party/rmlui/Backends/RmlUi_Platform_SDL.cpp"
+    "${REPO_ROOT}/third_party/rmlui/Backends/RmlUi_Renderer_SDL.cpp")
+
+# Prefix the repository-relative lists with REPO_ROOT.
+foreach(group VF2_APP VF2_MACHINE VF2_HOST VF2_CORE VF2_M68000)
+    set(abs "")
+    foreach(f ${${group}})
+        list(APPEND abs "${REPO_ROOT}/${f}")
+    endforeach()
+    set(${group} "${abs}")
+endforeach()
+
+add_library(main SHARED
+    ${VF2_APP} ${VF2_MACHINE} ${VF2_HOST} ${VF2_CORE} ${VF2_M68000} ${VF2_RML})
+
+target_compile_features(main PRIVATE cxx_std_20)
+target_compile_definitions(main PRIVATE
+    RMLUI_STATIC_LIB
+    RMLUI_FONT_ENGINE_FREETYPE
+    RMLUI_SDL_VERSION_MAJOR=3
+    VF2_GPU3D_SDL=1)
+target_include_directories(main PRIVATE
+    "${REPO_ROOT}/src/core/shim_include"
+    "${REPO_ROOT}/third_party/rmlui/Include"
+    "${REPO_ROOT}/third_party/rmlui/Backends"
+    "${REPO_ROOT}/third_party/freetype/include"
+    "${CMAKE_CURRENT_BINARY_DIR}")            # version.h
+
+# RmlUi and stb are third-party: no warnings (as in the Makefile).
+set_source_files_properties(${VF2_RML} "${REPO_ROOT}/src/host/stb_image_impl.cpp"
+    PROPERTIES COMPILE_OPTIONS "-w")
+
+target_link_libraries(main PRIVATE
+    SDL3::SDL3
+    freetype
+    sljit
+    z log android)
