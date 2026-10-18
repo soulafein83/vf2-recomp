@@ -171,6 +171,22 @@ on the start-up test scene; an on-screen pad for player 2; and the 2D renderer's
    `Display > Performance hints` is the one setting worth trying both ways, and `Display > GPU frames in
    flight` and `Display > Vsync` the other two.
 
+## Thanks
+
+Hi everyone!
+
+Huge thanks to [mr-finster](https://github.com/mr-finster/vf2-recomp) for the amazing work on the original
+recompilation!
+
+Based on that project, I managed to set up this fork and release my very first Android `.apk` build, with the
+help of AI. It's still a work in progress — performance isn't fully optimal yet (especially on Mali GPUs), but
+it's completely playable: you can navigate the menus, adjust settings and play matches without issues.
+
+If you have any ideas, performance optimization tips, or want to contribute, feel free to join in, open an
+[issue](https://github.com/soulafein83/vf2-recomp/issues) or submit a
+[pull request](https://github.com/soulafein83/vf2-recomp/pulls). Any feedback or contributions are very
+welcome!
+
 ## Licence
 
 MIT, as upstream: see [LICENSE](LICENSE). Code from MAME keeps its BSD-3-Clause licence and notices, and the
