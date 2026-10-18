@@ -137,10 +137,19 @@ writes `app/src/main/res/mipmap-*/ic_launcher.png` and the adaptive icon's two l
 filling the 108dp canvas, the letters inside the 66dp safe zone), which
 `mipmap-anydpi-v26/ic_launcher.xml` names. Any variant from that script's `PALETTES` works.
 
-## Not done yet
+## What is still owed
 
-The phone itself hasn't run it yet (see `vf2.md`): SLJIT's executable memory, the GPU's 3D on the
-Immortalis-G720, real touches, Android's Back, the sound on the speaker, and the frame rate the
-surface is given are the checks that need a device. Only arm64 is built; player 2 has no on-screen
-pad (a second gamepad or a keyboard plays them); and the 2D renderer's `Surface.setFrameRate` idea
-for forcing the refresh rate is parked.
+The phone has run it: `i960 native` (SLJIT's executable memory works), the GPU's 3D exact against the
+CPU's on the Immortalis-G720, the menu, the touches, Back, the immersive landscape window and the sound
+all work, and the board holds the game's 57.5 frames a second. What is left (see `vf2.md`, Modules 11
+and 12):
+
+- The GPU's own 3D runs under the game's frame rate on a Dimensity 9300+, so **2x at full speed is the
+  CPU 3D's**; at 5x/6x a 15-18 ms texture upload appears.
+- The governor still walks the render scale down from 2x to 1x while the frames and pictures are whole:
+  it costs sharpness and buys nothing.
+- `Display > Performance hints` and the new `the GPU at:` clock line in `log.txt` have not had their
+  A/B run on the phone yet.
+- Player 2 has no on-screen pad (a second gamepad or a keyboard plays them).
+- Only arm64 is built, and the 2D renderer's `Surface.setFrameRate` idea (forcing the surface's refresh
+  rate) is parked.
