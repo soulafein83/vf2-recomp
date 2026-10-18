@@ -9,6 +9,7 @@ recompiled to native code, with render scales up to 6x, widescreen and smooth mo
   <a href="https://github.com/mr-finster/vf2-recomp/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/mr-finster/vf2-recomp?label=release"></a>
   <a href="LICENSE"><img alt="Licence: MIT" src="https://img.shields.io/badge/licence-MIT-blue"></a>
   <img alt="Platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%2F%20Steam%20Deck-informational">
+  <img alt="Android" src="https://img.shields.io/badge/Android-arm64%20%2F%20Vulkan-informational">
 </p>
 
 <p align="center">
@@ -34,6 +35,14 @@ recompiled to native code, with render scales up to 6x, widescreen and smooth mo
 > `vf2` set (`vf2.zip`, Version 2.1). It is read on your computer, and the game's program is recompiled there each
 > time it starts. An unofficial fan project, not made, approved or supported by SEGA, and not affiliated with it.
 
+> [!NOTE]
+> **This is a fork** of [mr-finster/vf2-recomp](https://github.com/mr-finster/vf2-recomp) that adds an
+> **Android (arm64) port**, built and measured on a Xiaomi 14T Pro (MediaTek **Dimensity 9300+**, Arm
+> **Immortalis-G720 MC12**). The game is upstream's; what this fork adds for a phone, the settings it
+> gained, and what the phone's measurements say are under [Android](#android-this-fork), with the GPU
+> notes in [docs/ARM-IMMORTALIS-G720.md](docs/ARM-IMMORTALIS-G720.md). Upstream is the place for the
+> desktop releases and for bugs that are not about Android.
+
 ## About
 
 Virtua Fighter 2 Recomp runs the game's own program, for the board's Intel i960 CPU, recompiled to native code
@@ -54,7 +63,8 @@ screen's refresh rate.
 | Render scale up to 6x, widescreen and ultrawide, smooth motion | Working |
 | Menu, keyboard and gamepads, two players, the arcade's settings | Working |
 | macOS, Windows, Linux / Steam Deck | Working |
-| The 3D drawn on the GPU (Display > 3D renderer: Auto, GPU or CPU) | Working on macOS (Metal), Windows (Direct3D 12 or Vulkan) and Linux / Steam Deck (Vulkan): the same picture as the CPU's, checked when the game starts; Auto uses the GPU unless it's clearly slower, and any difference or error falls back to the CPU |
+| Android (arm64, Vulkan through SDL 3) | Working on the Xiaomi 14T Pro (Dimensity 9300+ / Immortalis-G720): menu, touch pad, Back, immersive landscape, sound, the GPU's 3D exact against the CPU's. The GPU's own 3D runs under the game's frame rate there, so 2x at full speed is the CPU 3D's — see [Android](#android-this-fork) |
+| The 3D drawn on the GPU (Display > 3D renderer: Auto, GPU or CPU) | Working on macOS (Metal), Windows (Direct3D 12 or Vulkan), Linux / Steam Deck (Vulkan) and Android (Vulkan, see [Android](#android-this-fork)): the same picture as the CPU's, checked when the game starts; Auto uses the GPU unless it's clearly slower, and any difference or error falls back to the CPU |
 | Stereo reverb (the sound board's DSP) | Working: wide stereo, as on the cabinet (fixed in v0.1.2) |
 | Portable mode, your own ROM folder | Working |
 | Secret characters (Menu > Cheats): Dural, MUE and KOJAC | Working |
@@ -153,6 +163,121 @@ Mac `open "Virtua Fighter 2 Recomp.app" --args --roms ~/ROMs/vf2`; Linux / Batoc
 > The Mac and Windows builds aren't signed. On macOS, open it once, close the message, then System Settings >
 > Privacy & Security > Open Anyway. On Windows, if SmartScreen warns, choose More info > Run anyway.
 
+## Android (this fork)
+
+The same game on an arm64 phone: the i960 program recompiled to native code as the game starts, MAME's
+Model 2A board around it, and SDL 3 in front — Vulkan through its GPU renderer, with the CPU's 3D as the
+fallback. Built and measured on a **Xiaomi 14T Pro** (MediaTek **Dimensity 9300+**, Arm
+**Immortalis-G720 MC12**, Android 16); nothing in it is specific to that phone. There are no Android
+packages to download: the APK is built from source, below. The player-facing version of the same steps is
+[android/README.md](android/README.md), and the port's plan with every phone run's numbers is
+[vf2.md](vf2.md).
+
+### What this fork adds
+
+| Piece | What it is |
+| --- | --- |
+| The Android port | `android/`: a Gradle 8.12 + AGP 8.7.3 project driving the NDK's CMake (NDK 30.0.16248370, SDK CMake 3.22.1, `arm64-v8a`, minSdk 26, targetSdk 34), with SDL 3 and FreeType from `third_party/` |
+| The host on Android | SDL's entry point and lifecycle (the sound stops in the background), the APK's `assets/` copied out once into the app's own folder, the `content://` ROM picker, immersive fullscreen and a landscape window, on-screen controls, Android's Back as the menu key, AAudio's *game* role, the launcher icon and git-based versioning |
+| Mali / Vulkan | the GPU device is created with `SDL_CreateGPUDeviceWithProperties` and clip distance, depth clamping, indirect-first-instance and anisotropy **off** — the same insurance SDL's own GPU renderer takes, without which SDL "excludes every Mali GPU" ([SDL #12652](https://github.com/libsdl-org/SDL/issues/12652); SDL's renderer does it, our fallback device path did not) |
+| Settings a phone needs | `Display > Vsync` (`0` asks for mailbox first — what lifted 2x here from 33 to 38-48 pictures/s), `Display > GPU frames in flight`, `Display > Performance hints` (Android 13 and up: the platform's own way of keeping the frame's threads and the GPU at their clocks), `Display > On-screen controls` |
+| What `log.txt` says | the present mode the window really gave (`mailbox` / `immediate` / `vsync`) and the Vulkan driver's name, version and info; the cores' and the **GPU's** clocks every 10 s (`the GPU at: 0.39 of 1.30 GHz`, read from `/sys/class/devfreq`); a `pace:` line every 10 s with how many pictures a second and where a picture's time went |
+| ROM-free checks | `make gpu3dbench` (the GPU's 3D against the CPU's, on the bench scene), `make touchcheck` (the on-screen pad, with SDL's own finger events), `make audiocheck` (the host's audio path and a test tone) — all three run on a PC, with no ROM |
+
+The phone's GPU needs no tricks of its own beyond that insurance: what this generation of Arm GPUs wants,
+what the numbers ruled out, and the sources are in [docs/ARM-IMMORTALIS-G720.md](docs/ARM-IMMORTALIS-G720.md).
+
+### What the phone's measurements say
+
+- **1x on the GPU**: 51-55 pictures/s against the game's own 57.5, `a picture 9.3-10.5 ms on the GPU`.
+- **2x on the GPU with smooth motion off**: ~51-56. **3x**: 41-47. **4x**: ~32. **5x/6x**: 21/19, where a
+  15-18 ms texture upload appears.
+- **2x at the game's full rate is the CPU 3D's** (57-62 pictures/s with smooth motion on) on this phone,
+  not the GPU's — the opposite of what the GPU renderer is for.
+- The picture rate hardly moves with the render scale (1x ≈ 3x), so the **~19 ms a picture is our own
+  loop's overhead, not fill**. On a CSF Mali like this one a compute pass and the tiler's binning cannot
+  overlap, and our GPU 3D is compute — a sourced explanation, not a fix.
+- `frames in flight` 1 ≈ 2 ≈ 3, so the swapchain was not the limiter. The two levers that measurably help
+  are **vsync off** and **smooth motion off**.
+- The governor still walks 2x down to 1x while 53-55 of 57.5 pictures are already on show: it costs
+  sharpness and buys nothing. Known, and not yet fixed.
+- **Stable 60 (the game's 57.5) at 2x-4x on the GPU is not reachable on this phone.** What is left is
+  host-side: the per-picture overhead, the governor's stopping rule, and the Auto 3D verdict.
+
+### What it needs
+
+| | |
+| --- | --- |
+| Phone | arm64, Android 8.0 (API 26) or newer. A Vulkan driver is expected but not required — the 3D can run on the CPU, and the game falls back to it by itself. No permission is asked for at all |
+| Build machine | Linux, macOS or Windows with a **JDK 17** or newer (the module compiles for Java 17) |
+| Android SDK | `platform-tools`, `platforms;android-34`, `build-tools;34.0.0`, **CMake 3.22.1** and **NDK 30.0.16248370** — the last two are named in `android/app/build.gradle` |
+| The repository | SDL 3 and FreeType are vendored in `third_party/` and are built by the same command: nothing to fetch, and no submodules |
+| ROM | your own `vf2.zip` (MAME's `vf2` set, Version 2.1) |
+
+### Build it, step by step
+
+1. Install a JDK 17 and the Android SDK's command-line tools, then the pieces the build names (the
+   `sdkmanager` is in `cmdline-tools/latest/bin`):
+
+   ```
+   sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "cmake;3.22.1" "ndk;30.0.16248370"
+   ```
+
+2. Point the build at the SDK, either with the environment:
+
+   ```
+   export ANDROID_HOME=~/Android/Sdk        # or ANDROID_SDK_ROOT
+   ```
+
+   or with a file `android/local.properties` holding `sdk.dir=/home/you/Android/Sdk`.
+
+3. Build the debug APK. The first build also compiles SDL 3 and FreeType and takes a couple of minutes;
+   later ones are seconds.
+
+   ```
+   cd android
+   ./gradlew :app:assembleDebug
+   ```
+
+4. The APK is `android/app/build/outputs/apk/debug/app-debug.apk`, signed with the debug key (it installs
+   by sideloading, not from the Play Store). Its `versionName` is the git tag — `v0.1.9` — and its
+   `versionCode` is that name's major.minor.patch (`109`), so each tagged build is an upgrade.
+
+### Run it, step by step
+
+1. With the phone attached (Developer options > USB debugging on):
+
+   ```
+   adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+   ```
+
+   or copy the APK over and open it on the phone.
+
+2. Start the game. It asks for your `vf2.zip` with Android's own file picker, checks it and keeps a copy,
+   so you do this once. Or drop the zip in and it is played where it lies:
+
+   ```
+   adb push vf2.zip /sdcard/Android/data/com.vf2recomp.vf2/files/roms/
+   ```
+
+3. Play. The touch pad is the d-pad at the bottom left and guard/punch/kick, Start and Menu at the bottom
+   right; **Back** opens the game's menu (or goes a page back inside it); a gamepad in Xbox layout, or a
+   keyboard, works as on the desktop (arrows + <kbd>Z</kbd> <kbd>X</kbd> <kbd>C</kbd> for player 1,
+   <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd> for player 2, <kbd>Esc</kbd> for the menu), and the
+   menu's Controls page rebinds all of it. The game starts immersive and in landscape, the picture follows
+   the panel's refresh rate, and everything it keeps (`settings.ini`, the saves, `log.txt`) is in the app's
+   own folder.
+
+4. When something is off, the game's own log says what it did:
+
+   ```
+   adb shell run-as com.vf2recomp.vf2 cat files/log.txt > log.txt
+   ```
+
+   Its `render state`, `pace:` and `performance hints` lines are the ones to read; on a phone that feels
+   slow, `Display > Performance hints` is the one setting worth trying both ways, and `Display > GPU
+   frames in flight` and `Display > Vsync` the other two.
+
 ## Controls
 
 Change them in the menu (<kbd>Esc</kbd>, or View / Select on a pad).
@@ -206,20 +331,37 @@ it's clearly slower than the CPU on that machine.
 | `src/gpu` | the GPU renderer for the 3D: Metal (`gpu3d_metal.mm`), SDL_GPU (`gpu3d_sdlgpu.cpp`), its HLSL compute shaders (`gpu3d.hlsl`) and their compiled SPIR-V / DXIL (`gpu3d_shaders.h`) |
 | `tools/gpu/shaders.sh`, `tools/gpu3dcmp.cpp` | compiles `gpu3d.hlsl` into `gpu3d_shaders.h` with DXC; compares the GPU's 3D with the CPU's |
 | `assets/` | the app icon, the menu (`ui/`) and its font, the player select's painted sides |
-| `third_party/` | MAME's i960 and 68000 cores and more, SLJIT, RmlUi, stb_image |
+| `android/` | the Android port: the Gradle + CMake project (manifest, Java side, icons) and `android/README.md` for a player |
+| `third_party/` | MAME's i960 and 68000 cores and more, SLJIT, RmlUi, stb_image, and (for the phone) SDL 3 and FreeType |
+| `docs/ARM-IMMORTALIS-G720.md` | what the phone's GPU wants and what it does not: the notes behind the Android settings and the new log lines |
+| `vf2.md` | the port's plan and log: the modules, each phone run's numbers, what is done and what is still open |
+| `analiza.md` | the analysis of two third-party suggestion notes: what was taken, what was left out, and why |
 | `tools/recomp` | the ahead-of-time recompiler (i960 to C++), for development |
-| `tools/*.cpp` | the headless runner (`vf2run`), disassembler, ROM set check, lockstep checker (`vf2lock`) |
+| `tools/*.cpp` | the headless runner (`vf2run`), disassembler, ROM set check, lockstep checker (`vf2lock`), and the ROM-free checks (`gpu3dbench`, `touchcheck`, `audiocheck`) |
 | `tools/*.py`, `tools/scripts` | comparisons with MAME's pictures, sound and traces; input scripts |
 | `tools/mac`, `tools/win`, `tools/deck`, `tools/release` | the release packages and their licence notices |
 
 ## Run it yourself
 
-Needs a C++20 compiler, zlib, SDL 3 and FreeType (Mac: `brew install sdl3 freetype`).
+### What you need
+
+- A C++20 compiler (clang or g++), GNU make and **zlib**.
+- **SDL 3** and **FreeType**, found through `pkg-config` (macOS: `brew install sdl3 freetype`; Arch:
+  `sdl3` and `freetype2`). They can also be pointed at by hand through `SDL_CFLAGS`/`SDL_LIBS` and
+  `FT_CFLAGS`/`FT_LIBS`.
+- For the phone instead of the desktop: a JDK 17 and the Android SDK and NDK — see
+  [Android](#android-this-fork) above.
+
+### Build and run (desktop)
 
 ```
 make                    # build/bin/vf2, and the headless tools
 build/bin/vf2 path/to/vf2.zip
 ```
+
+The three checks that need no ROM run here as well: `make gpu3dbench` (the GPU's 3D against the CPU's, on
+the bench scene), `make touchcheck` (the on-screen pad, with SDL's own finger events) and `make
+audiocheck` (the host's audio path and a test tone).
 
 The release packages: `tools/mac/package.sh` (Mac), `tools/win/build.sh` (Windows, cross-compiled with MinGW-w64),
 `tools/deck/build.sh` (Linux / Steam Deck: x86-64, in Valve's Steam Runtime "sniper" SDK container).
