@@ -38,27 +38,19 @@ target_compile_definitions(sljit PRIVATE SLJIT_CONFIG_AUTO=1)
 target_compile_options(sljit PRIVATE -w -O2)
 
 # ------------------------------------------------------------------- version.h
-execute_process(COMMAND git describe --tags --always
-    WORKING_DIRECTORY "${REPO_ROOT}"
-    OUTPUT_VARIABLE VF2_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-if(NOT VF2_VERSION)
-    set(VF2_VERSION "dev")
-endif()
-execute_process(COMMAND git log -1 --format=%cd --date=short
-    WORKING_DIRECTORY "${REPO_ROOT}"
-    OUTPUT_VARIABLE VF2_DATE OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-if(NOT VF2_DATE)
-    set(VF2_DATE "unknown")
-endif()
-# The commit too: what a GPU failure is remembered by (src/host/main.cpp's BUILD).
-execute_process(COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY "${REPO_ROOT}"
-    OUTPUT_VARIABLE VF2_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-if(NOT VF2_COMMIT)
-    set(VF2_COMMIT "unknown")
-endif()
-configure_file("${CMAKE_CURRENT_LIST_DIR}/version.h.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/version.h" @ONLY)
+# Made at every build, not only at configure time: a new commit must change the
+# version and the BUILD that a GPU failure is remembered by (src/host/main.cpp),
+# and Gradle doesn't reconfigure CMake just because git moved. The script writes
+# the file only when its content changes, so nothing is rebuilt needlessly.
+set(VF2_VERSION_H "${CMAKE_CURRENT_BINARY_DIR}/version.h")
+add_custom_target(vf2_version ALL
+    COMMAND ${CMAKE_COMMAND}
+        -DREPO_ROOT=${REPO_ROOT}
+        -DIN=${CMAKE_CURRENT_LIST_DIR}/version.h.in
+        -DOUT=${VF2_VERSION_H}
+        -P ${CMAKE_CURRENT_LIST_DIR}/version.cmake
+    BYPRODUCTS ${VF2_VERSION_H}
+    COMMENT "version.h from git")
 
 # ------------------------------------------------------------- the game's code
 set(VF2_APP
@@ -97,6 +89,7 @@ endforeach()
 
 add_library(main SHARED
     ${VF2_APP} ${VF2_MACHINE} ${VF2_HOST} ${VF2_CORE} ${VF2_M68000} ${VF2_RML})
+add_dependencies(main vf2_version)
 
 target_compile_features(main PRIVATE cxx_std_20)
 target_compile_definitions(main PRIVATE
