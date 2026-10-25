@@ -32,6 +32,12 @@ module by module), [docs/ARM-IMMORTALIS-G720.md](docs/ARM-IMMORTALIS-G720.md) (w
 and what it does not, with sources), and [analiza.md](analiza.md) (an analysis of two third-party
 suggestion notes: what was taken and what was left out).
 
+## Download
+
+The Android APK is on the [Releases](https://github.com/soulafein83/vf2-recomp/releases) page.
+It is arm64 only, needs Android 8.0 or newer and your own MAME `vf2.zip` (no game files are included);
+sideload it, as it is not on the Play Store.
+
 ## Changes from upstream
 
 ### What the phone adds
@@ -136,8 +142,9 @@ on the start-up test scene; an on-screen pad for player 2; and the 2D renderer's
    ```
 
 4. The APK is `android/app/build/outputs/apk/debug/app-debug.apk`, signed with the debug key (it installs by
-   sideloading, not from the Play Store). Its `versionName` is the git tag — `v0.1.9` — and its `versionCode`
-   is that name's major.minor.patch (`109`), so each tagged build is an upgrade.
+   sideloading, not from the Play Store). Its `versionName` is `git describe` (a tag, or the tag and commit),
+   and its `versionCode` is that name's major.minor.patch (`115` for `v0.1.15`), so each tagged build is an
+   upgrade.
 
 ## Run it, step by step
 
