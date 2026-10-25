@@ -12,6 +12,7 @@
 #include <vector>
 #if defined(__ANDROID__)
 #include <pthread.h>
+#include <unistd.h>
 #endif
 
 class row_pool
@@ -22,12 +23,13 @@ public:
 #if defined(__ANDROID__)
 	// The workers' ids as the kernel knows them, with this thread's first: the threads a frame's
 	// drawing runs on, which is what Android's performance hints (a session, ADPF) are asked over.
-	// On bionic a pthread_t is the thread id the kernel gave it.
+	// (bionic's pthread_t is a pointer to its own thread record, not the kernel's tid: gettid() for
+	// this thread, pthread_gettid_np() for the workers. ADPF wants the tids.)
 	std::vector<long> worker_tids()
 	{
 		std::vector<long> ids;
-		ids.push_back(long(pthread_self()));
-		for (auto &w : m_workers) ids.push_back(long(w.native_handle()));
+		ids.push_back(long(gettid()));
+		for (auto &w : m_workers) ids.push_back(long(pthread_gettid_np(w.native_handle())));
 		return ids;
 	}
 #endif
