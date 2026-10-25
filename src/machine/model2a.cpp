@@ -491,12 +491,15 @@ bool model2a::set_secret_character(int fighter)
 		memcpy(&rom[COPY], copy, N);
 		if (m_rec) m_rec->code_changed(COPY, N);
 	}
+	// (the code made again once for all of them, not once each: each is a whole native rebuild)
 	const u32 to = fighter ? COPY : TABLE;
+	u32 lo = ~0u, hi = 0;
 	for (u32 a : SETS)
 		if (word(a + 4) != to) {
 			memcpy(&rom[a + 4], &to, 4);
-			if (m_rec) m_rec->code_changed(a, 8);
+			lo = std::min(lo, a); hi = std::max(hi, a + 8);
 		}
+	if (m_rec && hi) m_rec->code_changed(lo, hi - lo);
 	return true;
 }
 

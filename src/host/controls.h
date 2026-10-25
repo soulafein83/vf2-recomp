@@ -3,6 +3,7 @@
 #pragma once
 #include <SDL3/SDL.h>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -58,7 +59,8 @@ struct player_controls
 			auto k = kv.find(p + "key_" + CONTROL_KEYS[a]);
 			if (k != kv.end())
 				key[a] = k->second == "none" ? SDL_SCANCODE_UNKNOWN
-					   : k->second[0] == '#' ? SDL_Scancode(std::clamp(atoi(k->second.c_str() + 1), 0, int(SDL_SCANCODE_COUNT) - 1))
+					   // ("#n", not the UK keyboard's # key: SDL names that "#")
+					   : k->second.size() > 1 && k->second[0] == '#' && isdigit((unsigned char)k->second[1]) ? SDL_Scancode(std::clamp(atoi(k->second.c_str() + 1), 0, int(SDL_SCANCODE_COUNT) - 1))
 											 : SDL_GetScancodeFromName(k->second.c_str());
 			auto b = kv.find(p + "pad_" + CONTROL_KEYS[a]);
 			if (b != kv.end()) pad[a] = pad_from_name(b->second);

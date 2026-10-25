@@ -87,7 +87,7 @@
 // Keys:  player 1: arrows, Z guard, X punch, C kick, 1 start
 //        player 2: I J K L, B guard, N punch, M kick, 2 start (both remapped in Controls)
 //        5 / 6 coins, F2 test, 9 service, Esc the menu, P pause, F3 reset, F5 render scale,
-//        F6 picture shape, F9 frame timings, F11 fullscreen, F12 a screenshot (Screenshots in
+//        F6 picture shape, F9 frame timings, F11 (or F, Alt+Enter) fullscreen, F12 a screenshot (Screenshots in
 //        the NVRAM folder), Tab held: as fast as it goes
 // Pads:  d-pad or left stick, X guard, A punch, B kick, Y guard+punch, RB punch+kick,
 //        LB guard+kick, RT all three, Start (with --arcade: starts only with a credit, as the
@@ -120,6 +120,9 @@
 //   VF2_GOVERN=1         the render scale governor in a test run too (else only on screen)
 //   VF2_TEST_LOAD=ms:s   each pass ms longer a frame (at 3x; by the scale's square) for the
 //                        first s seconds on show (the governor's tests: a slow start); VF2_SCREEN_HZ=n: the governor's screen as n Hz
+//   VF2_NO_VSYNC=1       vsync off, as a driver's settings can force it (smooth pictures then 120 a second)
+//   VF2_NO_EMU_THREAD=1  every frame run on the main thread (else, with smooth motion, the next one
+//                        runs on the game's own thread during the present's wait for vsync)
 //   VF2_THREADS=N        threads drawing the 3D (default: the cores less 1, 12 at most)
 //   VF2_KEYS=k@F,...     presses key k (an SDL key name: F5, F6, F11, Escape...) when game frame F
 //                        is reached, e.g. VF2_KEYS=F5@300,F11@400; its window as drawn 3 frames
@@ -163,17 +166,33 @@
 #include "touch_controls.h"
 #include "sysinfo.h"
 #include <SDL3/SDL.h>
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
 #if defined(_WIN32) || defined(__ANDROID__)
 #include <SDL3/SDL_main.h>   // WinMain on Windows; the SDLActivity's entry point on Android
 #endif
+#ifdef _WIN32
+// A laptop with two graphics chips (NVIDIA Optimus, AMD switchable graphics): the game on the faster one, not the one
+// in the processor, whatever Windows would pick. The drivers look for these two in the program's exports.
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <memory>
 #include <optional>
 #include <string>
@@ -418,6 +437,7 @@ struct pad_state
 {
 	bool back_was = false, back_combo = false, start_was = false;
 	bool menu_was = false, touch_was = false, sticks_was = false;   // the menu's other buttons (edges)
+	bool start_quiet = false;   // Start held as the menu closed (it closed it): not the game's till let go
 	int coin_frames = 0, start_delay = -1, start_frames = 0;
 };
 
@@ -472,6 +492,10 @@ hotkey read_inputs(model2a &m, SDL_Gamepad *pads[2], pad_state ps[2], const play
 		const bool kstart = key(ctl[p].key[C_START]);
 		if (kstart && !key_start_was[p]) press_start();
 		key_start_was[p] = kstart;
+		// Start held reaches the game too, the arcade way, as the cabinet's button: a fighter chosen with
+		// Start held is Dural (version 2.1's code). The PC way, a 6-frame press, as before v0.1.12: on a
+		// pad Start confirms and closes the menu, and holding it turned a pick into Dural by accident
+		bool start_held = kstart, start_now = kstart;
 		// Coin (a cabinet's coin slot, bound in the menu): a coin for this player, the arcade way
 		// (the PC way is free play: the game takes no coins)
 		const bool kcoin = key(ctl[p].key[C_COIN]);
@@ -521,6 +545,8 @@ hotkey read_inputs(model2a &m, SDL_Gamepad *pads[2], pad_state ps[2], const play
 				for (int a = C_GUARD; a < C_START; a++)
 					if (player_controls::pad_down(g, ctl[p].pad[a])) b |= BITS[a];   // (not Start nor Coin)
 				if (start && !st.start_was) press_start();
+				start_held |= start;
+				start_now |= start;
 			}
 			// View tapped on its own: whichever of Menu and Coin it's set as
 			if (!back && st.back_was && !st.back_combo) {
@@ -531,9 +557,15 @@ hotkey read_inputs(model2a &m, SDL_Gamepad *pads[2], pad_state ps[2], const play
 			st.back_was = back;
 			st.start_was = back ? btn(SDL_GAMEPAD_BUTTON_START) : start;
 		}
+		if (st.start_quiet) {   // (the Start that closed the menu: nothing, till it's let go)
+			if (!start_now) st.start_quiet = false;
+			start_held = false;
+			st.start_delay = -1;
+		}
 		if (st.coin_frames > 0) { in[0] |= coin_bit; st.coin_frames--; }
 		if (st.start_delay >= 0 && st.start_delay-- == 0) st.start_frames = 6;
 		if (st.start_frames > 0) { in[0] |= start_bit; st.start_frames--; }
+		if (start_held && !g_pc_mode) in[0] |= start_bit;
 	}
 	static bool down_was, start_was, in_test;
 	static int service_frames, test_ago = 1 << 20, test_mode_frames;
@@ -599,6 +631,53 @@ bool save_blob(const std::string &path, const void *src, size_t n)
 	return replace_file(path, tmp);
 }
 
+// The GPU's start marker: written in place and flushed (no swap: a rename's not on the disk until the folder is, and
+// a crash that takes the machine down in the driver would lose it).
+bool write_marker(const std::string &path, const char *text)
+{
+	FILE *f = fopen(path.c_str(), "wb");
+	if (!f) return false;
+	const size_t n = strlen(text);
+	const bool ok = fwrite(text, 1, n, f) == n && flush_to_disk(f);
+	return fclose(f) == 0 && ok;
+}
+
+// The saves written off the game's thread: save_blob flushes each file to the disk (a crash mid-save
+// keeps the old one), which on a hard disk waits tens of milliseconds a file, and the autosave ran
+// every few seconds in play: a hitch each time (a reporter: "on an SSD barely noticeable, on a HDD
+// heavy stutter even at 1x"). put() hands over a copy and returns at once; a writer thread saves
+// it, the newest copy of a file winning if two wait. finish() writes what's left and stops.
+struct bg_saver {
+	std::mutex mx;
+	std::condition_variable cv;
+	std::map<std::string, std::vector<uint8_t>> jobs;
+	bool stop = false;
+	std::thread th{ [this] { run(); } };
+	void put(const std::string &path, const void *src, size_t n) {
+		{ std::lock_guard<std::mutex> l(mx); if (stop) return; jobs[path].assign(static_cast<const uint8_t *>(src), static_cast<const uint8_t *>(src) + n); }
+		cv.notify_one();
+	}
+	void run() {
+		std::unique_lock<std::mutex> l(mx);
+		for (;;) {
+			cv.wait(l, [&] { return stop || !jobs.empty(); });
+			if (jobs.empty()) return;   // (stop, nothing left)
+			auto todo = std::move(jobs);
+			jobs.clear();
+			l.unlock();
+			for (auto &[path, bytes] : todo)
+				if (!save_blob(path, bytes.data(), bytes.size())) fprintf(stderr, "couldn't save %s\n", path.c_str());
+			l.lock();
+		}
+	}
+	void finish() {
+		{ std::lock_guard<std::mutex> l(mx); stop = true; }
+		cv.notify_one();
+		if (th.joinable()) th.join();
+	}
+	~bg_saver() { finish(); }
+};
+
 uint64_t fnv(const void *p, size_t n, uint64_t h = 1469598103934665603ull)
 {
 	for (size_t i = 0; i < n; i++) h = (h ^ static_cast<const uint8_t *>(p)[i]) * 1099511628211ull;
@@ -616,13 +695,16 @@ struct settings
 	int vsync = 1;
 	int on_screen = 1;   // the on-screen controls (a touch screen): 0 off, 1 while the player has no pad, 2 always
 	int secret = 0;   // Cheats > Secret character: the fighter in Akira's place (model2a::set_secret_character), 0 none
-	// settings.ini's version: 2 from v0.1.2 (none before), 3 from the phone's fullscreen. Its
+	// settings.ini's version: 2 from v0.1.2 (none before), 3 from the phone's fullscreen (this
+	// fork) or from the GPU's failures forgotten once (upstream v0.1.15), 4 the merged build. Its
 	// upgrades, once, as it's read:
 	//   2: the old default music volume, 20, to the new one, 50 (the music's stereo reverb mended:
 	//      at 20 it's now too quiet); a 20 chosen later is kept (the file then says version 2)
 	//   3: on a phone, fullscreen = 0 (the old default: the menu couldn't open on Android before
 	//      this version, so the player never chose it) to 1, the new default
-	static constexpr int VERSION = 3;
+	//   4: the GPU's failures saved by older builds forgotten once (upstream's 3; the fork's files
+	//      already say 3, so the merged build checks below 4, not below 3)
+	static constexpr int VERSION = 4;
 	int version = VERSION;
 	bool upgraded = false;   // (an upgrade made as it was read: saved at once)
 	// the 3D's renderer (Display > 3D renderer): 0 the CPU, 1 the GPU, 2 Auto (whichever is faster
@@ -630,6 +712,8 @@ struct settings
 	// scale and antialiasing ("3x1:g 2x1:c": a start there starts on that one, then checks it)
 	int renderer3d = 2, gpu_quality = 0;
 	std::string auto3d;
+	int graphics = 0;          // Windows: the GPU's driver, from the next start: 0 Auto (Vulkan first, Direct3D 12 if it won't start or draws no 3D), 1 Direct3D 12
+	static constexpr const char *BUILD = VF2_VERSION " " VF2_DATE " " VF2_COMMIT;   // (what gpu3d_failed and auto3d were learnt by)
 	std::string gpu3d_failed;   // SDL_GPU's drivers whose 3D failed here ("direct3d12 vulkan"): the next start tries the next
 	std::string roms_folder;   // where the player keeps vf2.zip (roms_folder = ...: kept as written)
 	int arcade_coin = -2;   // the arcade way's coin setting, kept while the PC way has FREE PLAY in its place (-1: none to give back; -2: none kept yet)   // the render scale this machine needed pipelining at (the governor's, kept: a start there starts pipelined)
@@ -690,8 +774,25 @@ struct settings
 		num("on_screen_controls", on_screen, 0, 2);
 		num("renderer_3d", renderer3d, 0, 2);
 		num("gpu_quality", gpu_quality, 0, 1);
+		num("graphics", graphics, 0, 1);
 		if (auto it = kv.find("auto_3d"); it != kv.end()) auto3d = it->second;
 		if (auto it = kv.find("gpu_3d_failed"); it != kv.end()) gpu3d_failed = it->second;
+		// (older builds saved a driver as failed for any GPU error in play, a suspend or a reset: every
+		// later start on the CPU. Forgotten once, each driver tried again from this build on)
+		if (file_version < 4 && (!gpu3d_failed.empty() || !auto3d.empty())) {
+			if (!gpu3d_failed.empty()) fprintf(stderr, "settings: the GPU drivers saved as failed (%s) tried again (an older build saved one failure in play for good)\n", gpu3d_failed.c_str());
+			gpu3d_failed.clear(); auto3d.clear(); upgraded = true;
+		}
+		// (and what another build learnt (another version or commit): forgotten, so each new build tries the
+		// GPU again, a driver updated since or a fix here. Remembered for ever, one bad start or one slow measure kept a
+		// Windows player's 3D on the CPU at every start after, its cost growing with the scale: slow above 1x)
+		std::string learnt_by;
+		if (auto it = kv.find("gpu_learnt_build"); it != kv.end()) learnt_by = it->second;
+		if ((!gpu3d_failed.empty() || !auto3d.empty()) && learnt_by != BUILD) {
+			fprintf(stderr, "settings: the GPU's failures (%s) and Auto's choices (%s) learnt by %s forgotten: this build tries the GPU again\n",
+			        gpu3d_failed.empty() ? "none" : gpu3d_failed.c_str(), auto3d.empty() ? "none" : auto3d.c_str(), learnt_by.empty() ? "an older build" : learnt_by.c_str());
+			gpu3d_failed.clear(); auto3d.clear(); upgraded = true;
+		}
 		if (auto it = kv.find("roms_folder"); it != kv.end()) roms_folder = it->second;
 		num("arcade_coins", arcade_coin, -2, 0x18);
 		num("secret_character", secret, 0, 12);
@@ -724,11 +825,19 @@ struct settings
 				}
 	}
 
-	void save(const std::string &path) const
+	// False if it couldn't be written (the caller keeps it to save again; said once in the log)
+	bool save(const std::string &path) const
 	{
 		const std::string tmp = path + ".tmp";
+		std::error_code ec;
+		if (const auto dir = std::filesystem::path(path).parent_path(); !dir.empty()) std::filesystem::create_directories(dir, ec);
 		FILE *f = fopen(tmp.c_str(), "w");
-		if (!f) return;
+		static bool said = false;
+		if (!f) {
+			if (!said) fprintf(stderr, "couldn't save the settings to %s: %s\n", path.c_str(), strerror(errno));
+			said = true;
+			return false;
+		}
 		fprintf(f, "# Virtua Fighter 2 settings (the in-game menu writes these)\n");
 		fprintf(f, "settings_version = %d\n", version);
 		fprintf(f, "scale = %d\npicture_shape = %d\nfullscreen = %d\nframe_timings = %d\nvolume = %d\narcade_mode = %d\n"
@@ -738,12 +847,17 @@ struct settings
 		fprintf(f, "perf_hints = %d\n", perf_hints);
 		fprintf(f, "secret_character = %d\n", secret);
 		fprintf(f, "on_screen_controls = %d\n", on_screen);
+		if (graphics) fprintf(f, "graphics = %d\n", graphics);
 		if (!gpu3d_failed.empty()) fprintf(f, "gpu_3d_failed = %s\n", gpu3d_failed.c_str());
+		if (!gpu3d_failed.empty() || !auto3d.empty()) fprintf(f, "gpu_learnt_build = %s\n", BUILD);
 		if (!roms_folder.empty()) fprintf(f, "roms_folder = %s\n", roms_folder.c_str());
 		for (int p = 0; p < 2; p++) ctl[p].save(f, p);
 		const bool flushed = flush_to_disk(f);
-		if (fclose(f) == 0 && flushed) replace_file(path, tmp);
-		else { std::error_code ec; std::filesystem::remove(tmp, ec); }
+		if (fclose(f) == 0 && flushed && replace_file(path, tmp)) return true;
+		std::filesystem::remove(tmp, ec);
+		if (!said) fprintf(stderr, "couldn't save the settings to %s\n", path.c_str());
+		said = true;
+		return false;
 	}
 };
 
@@ -773,10 +887,20 @@ bool first_launch(const std::string &data, const std::string &folder, romset::re
 			}
 		}
 	}
+	// where a picked set goes: the ROM folder, but never over the player's own set there (one that
+	// failed the check goes on failing; the picked one in the data folder's roms, looked in next time)
+	fs::path dest = roms;
 	if (fs::is_regular_file(zip, ec)) {
 		romset::result r = romset::load(zip.string());
 		if (r.ok) { out = std::move(r); return true; }
 		problem = r.error + "\n\n";
+		if (!folder.empty()) {
+			dest = own;
+			if (fs::is_regular_file(own / "vf2.zip", ec)) {
+				romset::result r2 = romset::load((own / "vf2.zip").string());
+				if (r2.ok) { fprintf(stderr, "the ROM folder's set: %s; the game from %s\n", r.error.c_str(), own.string().c_str()); out = std::move(r2); return true; }
+			}
+		}
 	}
 	if (getenv("VF2_HIDDEN")) {   // (a test run: no dialogs, no file picker)
 		fprintf(stderr, "%sno vf2.zip in %s\n", problem.c_str(), roms.string().c_str());
@@ -784,23 +908,24 @@ bool first_launch(const std::string &data, const std::string &folder, romset::re
 	}
 	SDL_Init(SDL_INIT_VIDEO);
 	const char *title = "Virtua Fighter 2";
-	const std::string where = "It's copied into " + roms.string() + ", so you only do this once.";
+	const std::string where = "It's copied into " + dest.string() + ", so you only do this once.";
 	std::string note = problem + "Choose your copy of Virtua Fighter 2: MAME's \"vf2\" set (vf2.zip, Version 2.1).\n\n" + where;
 	for (;;) {
 		if (!message_box(SDL_MESSAGEBOX_INFORMATION, title, note)) return false;
-		struct pick { bool done = false, failed = false; std::vector<std::string> files; } chosen;
+		// (SDL may answer on another thread: done is set last, released, so failed and files are seen)
+		struct pick { std::atomic<bool> done{ false }; bool failed = false; std::vector<std::string> files; } chosen;
 		static const SDL_DialogFileFilter filters[] = { { "MAME ROM sets (zip)", "zip" } };
 		SDL_ShowOpenFileDialog([](void *ud, const char *const *list, int) {
 			auto *c = static_cast<pick *>(ud);
 			if (!list) c->failed = true;                  // no picker here (e.g. Steam Deck Game Mode)
 			else for (; *list; list++) c->files.push_back(*list);
-			c->done = true;
+			c->done.store(true, std::memory_order_release);
 		}, &chosen, nullptr, filters, 1, nullptr, false);
-		while (!chosen.done) { SDL_Event e; while (SDL_PollEvent(&e)) {} SDL_Delay(10); }
+		while (!chosen.done.load(std::memory_order_acquire)) { SDL_Event e; while (SDL_PollEvent(&e)) {} SDL_Delay(10); }
 		if (chosen.failed) {
-			fs::create_directories(roms, ec);
+			fs::create_directories(dest, ec);
 			const std::string msg = "There's no file picker here. Put your vf2.zip in this folder, then start the game again:\n\n"
-									+ roms.string();
+									+ dest.string();
 			message_box(SDL_MESSAGEBOX_INFORMATION, title, msg);
 			return false;
 		}
@@ -831,10 +956,10 @@ bool first_launch(const std::string &data, const std::string &folder, romset::re
 			note = fs::path(f).filename().string() + ": " + r.error + "\n\nChoose MAME's \"vf2\" set (vf2.zip).\n\n" + where;
 			continue;
 		}
-		fs::create_directories(roms, ec);
-		if (!fs::equivalent(f, zip, ec)) fs::copy_file(f, zip, fs::copy_options::overwrite_existing, ec);
+		fs::create_directories(dest, ec);
+		if (!fs::equivalent(f, dest / "vf2.zip", ec)) fs::copy_file(f, dest / "vf2.zip", fs::copy_options::overwrite_existing, ec);
 		if (ec) {
-			note = "Couldn't copy it into " + roms.string() + ": " + ec.message() + "\n\nChoose your vf2.zip.";
+			note = "Couldn't copy it into " + dest.string() + ": " + ec.message() + "\n\nChoose your vf2.zip.";
 			continue;
 		}
 		out = std::move(r);
@@ -846,6 +971,11 @@ bool first_launch(const std::string &data, const std::string &folder, romset::re
 
 int main(int argc, char **argv)
 {
+#ifdef __APPLE__
+	// the game, its drawing and its sound on the performance cores: without it an M-series Mac can put
+	// them on the efficiency cores (VF3's d5b1992)
+	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 	// test runs (VF2_HIDDEN): a background process on macOS, so no Dock icon appears for each one
 	if (getenv("VF2_HIDDEN")) SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "1");
 	const auto launch_t = std::chrono::steady_clock::now();
@@ -1027,11 +1157,20 @@ int main(int argc, char **argv)
 	// game's first settings, an arcade setting changed in the first seconds).
 	auto nvram_hash = [&] { return fnv(m.eeprom_cells(), 128, fnv(m.backup_ram().data(), m.backup_ram().size())); };
 	uint64_t saved_hash = nvram_hash();
-	auto save_nvram = [&] {
+	bg_saver saver;   // (the autosave's writes, off the game's thread)
+	bool nv_put = false;   // (the backup handed to it: the last save at quit writes it whatever, in case its write failed)
+	auto save_nvram = [&](bool now) {
 		if (quit_after >= 0 && !test_saves) return;   // test runs leave the saves alone
 		const uint64_t h = nvram_hash();
-		if (h == saved_hash) return;
+		if (h == saved_hash && !(now && nv_put)) return;
 		std::filesystem::create_directories(data, ec);
+		if (!now) {
+			nv_put = true;   // (play: handed to the writer; a failed write says so in the log, tried at the next change)
+			saver.put(backup_path, m.backup_ram().data(), m.backup_ram().size());
+			saver.put(eeprom_path, m.eeprom_cells(), 64 * sizeof(u16));
+			saved_hash = h;
+			return;
+		}
 		if (save_blob(backup_path, m.backup_ram().data(), m.backup_ram().size()) &&
 			save_blob(eeprom_path, m.eeprom_cells(), 64 * sizeof(u16)))
 			saved_hash = h;
@@ -1137,6 +1276,33 @@ int main(int argc, char **argv)
 	SDL_HideCursor();
 	int focus_checks = 600;   // about 5 s: going fullscreen on a Mac moves to a new Space, which takes a while
 	SDL_Renderer *ren = nullptr;
+	// Why the 3D is on the CPU when the setting isn't CPU: said on screen, not only in the log (a player whose GPU
+	// couldn't be used just saw a slow game). cpu_why_new: not said yet.
+	std::string cpu_why;
+	bool cpu_why_new = false;
+	bool gpu_crashed = false;   // (the last start closed while starting the GPU: the menu's row says so until a choice there)
+	bool gpu_unavailable = false;   // (the gpu renderer won't start here, or isn't tried (CRT Emudriver): the row's not "from the next start")
+	// (why: what happened, in a player's words; then what to do. None with a renderer chosen by hand, SDL_RENDER_DRIVER)
+#ifdef __APPLE__
+	static const char *UPDATE = "Updating macOS may help; the next start tries the GPU again.";
+#else
+	static const char *UPDATE = "Updating the graphics driver may help; the next start tries the GPU again.";
+#endif
+	// (every start tries the GPU again, a failure remembered only for Windows' order of drivers: only a crashed start
+	// waits for the player)
+	static const char *RETRY = "Press left or right on Display > 3D renderer to try it again from the next start.";
+	auto on_cpu_because = [&](const std::string &why, const char *what_to_do) {
+		if (cpu_why.empty() && !getenv("SDL_RENDER_DRIVER")) { cpu_why = why + "." + (*what_to_do ? std::string(" ") + what_to_do : ""); cpu_why_new = true; }
+	};
+	// (the GPU start's marker kept through the first 15 s of play, its shaders, first pictures and checks too, a driver
+	// that closes the game there caught as well as one in its start; taken away then, or on quitting)
+	std::string marker_live;
+	uint64_t marker_until = 0;
+	auto marker_done = [&](bool now) {
+		if (marker_live.empty() || (!now && SDL_GetTicks() < marker_until)) return;
+		SDL_RemovePath(marker_live.c_str());
+		marker_live.clear();
+	};
 #ifdef VF2_GPU3D_SDL
 	// The 3D on the GPU wanted (Auto or GPU, the setting or VF2_3D): SDL's "gpu" renderer (Direct3D
 	// 12 on Windows, Vulkan on Linux and the Deck), whose device the 3D's compute shares, its
@@ -1154,20 +1320,57 @@ int main(int argc, char **argv)
 		const std::string cards = sysinfo::gpu_names();
 		const bool known_bad = cards.find("CRT Emudriver") != std::string::npos;
 		if (known_bad && (e ? strcmp(e, "cpu") != 0 : cfg.renderer3d != 0))
-			fprintf(stderr, "SDL's gpu renderer: not tried with CRT Emudriver (its start crashes there): SDL's usual renderer, the CPU's 3D\n");
-		const bool crashed = known_bad || SDL_GetPathInfo(marker.c_str(), nullptr);
-		if (crashed && !known_bad && (e ? strcmp(e, "cpu") != 0 : cfg.renderer3d != 0))
-			fprintf(stderr, "SDL's gpu renderer: the last start closed while starting it (%s): SDL's usual renderer, the CPU's 3D\n", marker.c_str());
+			{ gpu_unavailable = true; fprintf(stderr, "SDL's gpu renderer: not tried with CRT Emudriver (its start crashes there): SDL's usual renderer, the CPU's 3D\n"); on_cpu_because("CRT Emudriver can't run the GPU renderer", "Choosing CPU in Display > 3D renderer hides this message."); }
+		// (the marker holds the build that left it: another build's, a driver or a fix since, the GPU tried again)
+		std::string marker_build;
+		bool marker_there = false;
+		if (SDL_GetPathInfo(marker.c_str(), nullptr)) {
+			marker_there = true;
+			size_t n = 0;
+			if (void *d = SDL_LoadFile(marker.c_str(), &n)) { marker_build.assign(static_cast<const char *>(d), n); SDL_free(d); }
+		}
+		bool crashed = known_bad || (marker_there && marker_build == settings::BUILD);
+		auto failed_before = [&](const char *d) { return (" " + cfg.gpu3d_failed + " ").find(std::string(" ") + d + " ") != std::string::npos; };
+#ifdef _WIN32
+		// (Windows: the driver that start was on passed over for this build and the other tried now, not the CPU: a
+		// Vulkan driver that closes the game goes to Direct3D 12 by itself, and the other way round. Both: the CPU.)
+		if (crashed && !known_bad && !getenv("SDL_GPU_DRIVER")) {
+			const bool card = !cards.empty() && !(cards.rfind("Microsoft", 0) == 0 && cards.find(", ") == std::string::npos);
+			const bool was_vk = (failed_before("direct3d12") || (card && cfg.graphics == 0)) && !failed_before("vulkan");
+			const char *drv = was_vk ? "vulkan" : "direct3d12", *other = was_vk ? "direct3d12" : "vulkan";
+			if (!failed_before(other)) {
+				fprintf(stderr, "SDL's gpu renderer: the last start closed while starting it on %s: %s this start\n", drv, other);
+				if (!failed_before(drv)) cfg.gpu3d_failed += (cfg.gpu3d_failed.empty() ? "" : " ") + std::string(drv);
+				cfg.save(settings_path);   // (now: should the other close the game too, the next start knows both did)
+				crashed = false;
+				marker_there = false;   // (said)
+			}
+		}
+#endif
+		if (crashed && !known_bad && (e ? strcmp(e, "cpu") != 0 : cfg.renderer3d != 0) && !getenv("SDL_RENDER_DRIVER"))
+			{ fprintf(stderr, "SDL's gpu renderer: the last start closed while starting it (%s): SDL's usual renderer, the CPU's 3D (a new build tries it again)\n", marker.c_str()); gpu_crashed = !getenv("SDL_RENDER_DRIVER"); on_cpu_because("the graphics driver closed the game the last time the GPU started", RETRY); }
+		else if (marker_there && !known_bad && !crashed && (e ? strcmp(e, "cpu") != 0 : cfg.renderer3d != 0) && !getenv("SDL_RENDER_DRIVER"))
+			fprintf(stderr, "SDL's gpu renderer: %s closed while starting it: this build tries it again\n", marker_build.empty() ? "an older build" : marker_build.c_str());
 		if (!crashed && (e ? strcmp(e, "cpu") != 0 : cfg.renderer3d != 0) && !getenv("SDL_RENDER_DRIVER")) {
-			if (SDL_IOStream *io = SDL_IOFromFile(marker.c_str(), "w")) SDL_CloseIO(io);
+			write_marker(marker, settings::BUILD);   // (flushed to the disk: a crash that takes the machine down keeps it)
 			const auto t0 = std::chrono::steady_clock::now();
 			// (a driver whose 3D failed its check here before is passed over: Direct3D 12's for Vulkan,
 			// SDL's other on Windows (some older cards draw nothing on one and are fine on the other);
 			// SDL_GPU_DRIVER, SDL's own, chooses over this)
-			auto failed_before = [&](const char *d) { return (" " + cfg.gpu3d_failed + " ").find(std::string(" ") + d + " ") != std::string::npos; };
-			const bool try_vulkan = failed_before("direct3d12") && !failed_before("vulkan") && !getenv("SDL_GPU_DRIVER");
+			// (vf2-recomp #19: an RX 9070 on Direct3D 12 took 15 s to start and ~29 ms to take each
+			// picture, 30 a second at any scale; on Vulkan 6x ran at the screen's rate. A Radeon's
+			// Vulkan first then, and since #21 and #22 (NVIDIA: ~100 ms a 3D picture on Direct3D 12,
+			// ~5-10 on Vulkan) any card's on Windows, not Microsoft's software one; Direct3D 12 if
+			// Vulkan won't start or draws no 3D, remembered, or if Display > Graphics driver says so)
+#ifdef _WIN32
+			const bool card = !cards.empty() && !(cards.rfind("Microsoft", 0) == 0 && cards.find(", ") == std::string::npos);
+#else
+			const bool card = false;
+#endif
+			const bool vk_first = card && cfg.graphics == 0 && !failed_before("vulkan") && !getenv("SDL_GPU_DRIVER");
+			const bool try_vulkan = (failed_before("direct3d12") || vk_first) && !failed_before("vulkan") && !getenv("SDL_GPU_DRIVER");
 			if (try_vulkan) {
-				fprintf(stderr, "SDL's gpu renderer: Vulkan (the 3D failed on Direct3D 12 here before)\n");
+				fprintf(stderr, "SDL's gpu renderer: Vulkan (%s)\n", failed_before("direct3d12") ? "the 3D failed on Direct3D 12 here before" : "Windows: Vulkan first");
 				SDL_SetHint(SDL_HINT_GPU_DRIVER, "vulkan");
 			}
 			ren = SDL_CreateRenderer(win, "gpu");
@@ -1214,7 +1417,15 @@ int main(int argc, char **argv)
 			if (ren && !getenv("SDL_GPU_DRIVER") && !getenv("VF2_GPU3D_NO_PROBE") && !(failed_before("direct3d12") && failed_before("vulkan"))) {
 				SDL_GPUDevice *gd = SDL_GetGPURendererDevice(ren);
 				const char *drv = gd ? SDL_GetGPUDeviceDriver(gd) : nullptr;
-				if (drv && !strcmp(drv, "direct3d12") && draws_3d(ren) == 0) {
+				if (drv && !strcmp(drv, "vulkan") && vk_first && !failed_before("direct3d12") && draws_3d(ren) == 0) {
+					// (Vulkan chosen first draws nothing: Direct3D 12, as before #19)
+					fprintf(stderr, "SDL's gpu renderer: Vulkan draws no 3D here: Direct3D 12 instead\n");
+					cfg.gpu3d_failed += (cfg.gpu3d_failed.empty() ? "" : " ") + std::string("vulkan");
+					cfg_dirty = true;
+					SDL_DestroyRenderer(ren);
+					SDL_ResetHint(SDL_HINT_GPU_DRIVER);
+					ren = SDL_CreateRenderer(win, "gpu");
+				} else if (drv && !strcmp(drv, "direct3d12") && draws_3d(ren) == 0) {
 					fprintf(stderr, "SDL's gpu renderer: Direct3D 12 draws no 3D here: Vulkan instead\n");
 					if (!failed_before("direct3d12")) { cfg.gpu3d_failed += (cfg.gpu3d_failed.empty() ? "" : " ") + std::string("direct3d12"); cfg_dirty = true; }
 					SDL_DestroyRenderer(ren);
@@ -1230,8 +1441,8 @@ int main(int argc, char **argv)
 					} else fprintf(stderr, "SDL's gpu renderer: Vulkan draws the 3D here\n");
 				}
 			}
-			SDL_RemovePath(marker.c_str());
-			if (!ren) fprintf(stderr, "SDL's gpu renderer: %s (SDL's usual renderer, the CPU's 3D)\n", SDL_GetError());
+			marker_live = marker; marker_until = SDL_GetTicks() + 15000;
+			if (!ren) { fprintf(stderr, "SDL's gpu renderer: %s (SDL's usual renderer, the CPU's 3D)\n", SDL_GetError()); on_cpu_because("the GPU renderer wouldn't start", UPDATE); gpu_unavailable = true; }
 			else fprintf(stderr, "SDL's gpu renderer started in %.0f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 		}
 	}
@@ -1252,7 +1463,8 @@ int main(int argc, char **argv)
 	// pictures, more of them a second, one or two frames more delay. Whatever's asked for here, the
 	// log's render state line and the 10 s pace lines are where it's seen.
 	auto apply_display_settings = [&] {
-		if (!SDL_SetRenderVSync(ren, cfg.vsync)) fprintf(stderr, "vsync %d: %s\n", cfg.vsync, SDL_GetError());
+		const int want_vsync = getenv("VF2_NO_VSYNC") ? 0 : cfg.vsync;   // (VF2_NO_VSYNC=1: tests, as a driver forcing it off)
+		if (!SDL_SetRenderVSync(ren, want_vsync)) fprintf(stderr, "vsync %d: %s\n", want_vsync, SDL_GetError());
 		const char *rname = SDL_GetRendererName(ren);
 		SDL_GPUDevice *gd = rname && !strcmp(rname, "gpu") ? SDL_GetGPURendererDevice(ren) : nullptr;
 		if (gd && !SDL_SetGPUAllowedFramesInFlight(gd, Uint32(cfg.frames_in_flight)))
@@ -1266,7 +1478,7 @@ int main(int argc, char **argv)
 		if (gd) {
 			const bool mailbox = SDL_WindowSupportsGPUPresentMode(gd, win, SDL_GPU_PRESENTMODE_MAILBOX);
 			const bool immediate = SDL_WindowSupportsGPUPresentMode(gd, win, SDL_GPU_PRESENTMODE_IMMEDIATE);
-			const char *mode = cfg.vsync ? "vsync" : mailbox ? "mailbox" : immediate ? "immediate" : "vsync";
+			const char *mode = want_vsync ? "vsync" : mailbox ? "mailbox" : immediate ? "immediate" : "vsync";
 			SDL_PropertiesID pr = SDL_GetGPUDeviceProperties(gd);
 			const char *dn = SDL_GetStringProperty(pr, SDL_PROP_GPU_DEVICE_DRIVER_NAME_STRING, nullptr);
 			const char *dv = SDL_GetStringProperty(pr, SDL_PROP_GPU_DEVICE_DRIVER_VERSION_STRING, nullptr);
@@ -1274,7 +1486,7 @@ int main(int argc, char **argv)
 			std::string drv = std::string(dn ? dn : "?") + " " + (dv ? dv : "?");
 			if (di && *di) drv += " (" + std::string(di) + ")";
 			fprintf(stderr, "the GPU's present mode: %s (vsync %s; mailbox%s, immediate%s); the driver: %s\n",
-				mode, cfg.vsync ? "on" : "off", mailbox ? "" : " no", immediate ? "" : " no", drv.c_str());
+				mode, want_vsync ? "on" : "off", mailbox ? "" : " no", immediate ? "" : " no", drv.c_str());
 		}
 	};
 	apply_display_settings();
@@ -1366,6 +1578,7 @@ int main(int argc, char **argv)
 	bool deck = false;
 	gpu_picture gpu_pic(ren);
 	struct { bool on = false, any_scale = false, shown = false, pending = false; model2a::picture_parts parts; } gpu;
+	bool soft_render = false;   // (the renderer is the CPU's: SDL's software one, llvmpipe, SwiftShader. Auto measures there)
 	{
 		const char *g = getenv("VF2_GPU");
 		const char *name = SDL_GetRendererName(ren);
@@ -1382,6 +1595,7 @@ int main(int argc, char **argv)
 		}
 		deck = getenv("SteamDeck") || (gl && (strstr(gl, "vangogh") || strstr(gl, "VANGOGH")));   // (a Steam Deck's GPU, Steam or not)
 		const bool soft_gl = gl && (strstr(gl, "llvmpipe") || strstr(gl, "softpipe") || strstr(gl, "Software") || strstr(gl, "SwiftShader"));
+		soft_render = (name && !strcmp(name, "software")) || soft_gl;
 		gpu.on = g ? atoi(g) != 0 : !(name && !strcmp(name, "software")) && !soft_gl;
 		gpu.any_scale = g && atoi(g) == 1;
 		if (const char *c = getenv("VF2_GPU_CHECK")) gpu_pic.check_every = std::max(0, atoi(c));
@@ -1559,7 +1773,7 @@ int main(int argc, char **argv)
 		if (rn && !strcmp(rn, "gpu")) {
 			if (SDL_GPUDevice *gd = SDL_GetGPURendererDevice(ren)) g3.dev = gpu3d_create_sdlgpu(gd);
 			g3.verify = g3.dev ? 2 : 0;
-		} else if (!getenv("SDL_RENDER_DRIVER")) g3.next_start = true;
+		} else if (!getenv("SDL_RENDER_DRIVER") && !gpu_unavailable) g3.next_start = true;
 #endif
 		if (g3.dev) {
 			g3.dev->set_quality(cfg.gpu_quality || getenv("VF2_GPU3D_FAST") ? gpu3d_quality::fast : gpu3d_quality::exact);
@@ -1567,6 +1781,9 @@ int main(int argc, char **argv)
 		}
 		fprintf(stderr, "the 3D on the GPU: %s (%.0f ms to start)\n", g3.dev ? g3.dev->name() : g3.next_start ? "from the next start (the CPU's 3D)" : "no GPU renderer for it here (the CPU's 3D)",
 				std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+#if defined(VF2_GPU3D_METAL) || defined(VF2_GPU3D_SDL)
+		if (!g3.dev && !g3.next_start && g3.mode != R3D_CPU) on_cpu_because("the GPU renderer couldn't start here", UPDATE);
+#endif
 	};
 	fprintf(stderr, "the 3D: %s%s\n", R3D_NAMES[g3.mode], g3.forced_mode ? " (VF2_3D)" : "");
 	if (g3.mode != R3D_CPU) g3_start();
@@ -1576,20 +1793,39 @@ int main(int argc, char **argv)
 		g3.w = g3.h = 0;
 		g3.pending = false;
 	};
-	auto g3_fail = [&](const char *why) {
-		fprintf(stderr, "the 3D on the GPU: %s: on the CPU from now on\n", why);
+	// (keep: the driver it failed on saved, the next start tries SDL's other. Only for its start's check
+	// and its textures: a picture failing in play (a suspend and resume, a reset) is the CPU for this
+	// run only; saved, one bad moment on a Deck, Vulkan its only driver, put every later start on the CPU)
+	auto g3_fail = [&](const char *why, bool keep = true) {
+		fprintf(stderr, "the 3D on the GPU: %s: on the CPU for this run%s\n", why, keep ? " (the driver noted for Windows' order)" : "");
+		// (its start's check or its textures: kept for this build, the menu tries again; a picture failing in play, a
+		// sleep or a GPU reset: for this run only)
+		bool other_next = false;   // (Windows: the other driver not tried yet, so the next start tries it by itself)
+		auto say = [&] {
+			if (g3.mode == R3D_CPU) return;
+			if (keep && strstr(why, "no targets that size")) on_cpu_because("the picture is too large for the GPU at this scale", "A lower Display > Render scale puts it back on the GPU from the next start.");
+			else if (keep) on_cpu_because(strstr(why, "aren't the CPU's") ? "the GPU drew the 3D wrongly here" : "the GPU's 3D failed here",
+			                              other_next ? "The next start tries the GPU on Windows' other graphics driver." : UPDATE);
+			else on_cpu_because("the GPU's 3D stopped working", "The next start tries the GPU again.");
+		};
 		g3.failed = true; g3.on = false;
 		g3_free();
 #ifdef VF2_GPU3D_SDL
 		// the driver it failed on, kept: the next start tries SDL's other (Direct3D 12, then Vulkan)
+		if (!keep || strstr(why, "no targets that size")) { say(); return; }   // (too large for any driver: none blamed)
 		if (SDL_GPUDevice *d = static_cast<SDL_GPUDevice *>(SDL_GetPointerProperty(SDL_GetRendererProperties(ren), SDL_PROP_RENDERER_GPU_DEVICE_POINTER, nullptr)))
 			if (const char *drv = SDL_GetGPUDeviceDriver(d); drv && (" " + cfg.gpu3d_failed + " ").find(std::string(" ") + drv + " ") == std::string::npos) {
 				cfg.gpu3d_failed += (cfg.gpu3d_failed.empty() ? "" : " ") + std::string(drv);
 				cfg_dirty = true;
 				if (!strcmp(drv, "direct3d12") && cfg.gpu3d_failed.find("vulkan") == std::string::npos)
 					fprintf(stderr, "the 3D on the GPU: the next start tries Vulkan\n");
+#ifdef _WIN32
+				const char *other = !strcmp(drv, "vulkan") ? "direct3d12" : !strcmp(drv, "direct3d12") ? "vulkan" : nullptr;
+				other_next = other && (" " + cfg.gpu3d_failed + " ").find(std::string(" ") + other + " ") == std::string::npos && !getenv("SDL_GPU_DRIVER");
+#endif
 			}
 #endif
+		say();
 	};
 	// the targets, the picture's size (false: none here, the CPU's 3D)
 	auto g3_targets = [&](int w, int h) -> bool {
@@ -1628,14 +1864,14 @@ int main(int argc, char **argv)
 		f.edge = aa == 0 && f.ss == 1;
 		f.backdrop = p.backdrop; f.mid = p.mid; f.w2d = p.w; f.pad = model2a::picture_parts::PAD;
 		f.bdx = p.bdx; f.bdy = p.bdy; f.filter = p.filter; f.version2d = p.version;
-		if (!g3.dev->submit(g3.list.data(), g3.list.size(), f, target)) { g3_fail("a picture couldn't be drawn"); return false; }
+		if (!g3.dev->submit(g3.list.data(), g3.list.size(), f, target)) { g3_fail("a picture couldn't be drawn", false); return false; }
 		return true;
 	};
 	// the GPU's picture finished (its timings counted)
 	auto g3_finish = [&]() -> bool {
 		if (!g3.dev || !g3.dev->busy()) return !g3.failed;
 		double gms = 0, cms = 0;
-		if (!g3.dev->finish(&gms, &cms)) { g3_fail("a picture failed on the GPU"); return false; }
+		if (!g3.dev->finish(&gms, &cms)) { g3_fail("a picture failed on the GPU", false); return false; }
 		g3.sum_gpu += gms; g3.sum_cpu += cms; g3.pictures++;
 		return true;
 	};
@@ -1644,7 +1880,7 @@ int main(int argc, char **argv)
 	auto g3_settle = [&]() -> bool {
 		if (!g3.dev || !g3.dev->busy()) return !g3.failed;
 		double gms = 0, cms = 0;
-		if (!g3.dev->settle(&gms, &cms)) { g3_fail("a picture failed on the GPU"); return false; }
+		if (!g3.dev->settle(&gms, &cms)) { g3_fail("a picture failed on the GPU", false); return false; }
 		if (gms >= 0) { g3.sum_gpu += gms; g3.sum_cpu += cms; g3.pictures++; } else g3.unwaited++;
 		return true;
 	};
@@ -1803,8 +2039,13 @@ int main(int argc, char **argv)
 			// (It was 8 ms, half the frame: a Radeon 780M at 6x (vf2-recomp #10) takes ~9.5 ms on any
 			// scene, its pixels' passes a floor, and a light scene checked after the menu put the 3D
 			// on the CPU (4.8 ms there), which then took ~28 ms on a fight's and dropped to 30 fps.)
+			// (now, as VF1's since 18 Oct: the GPU whenever it works, its check of the pictures passed; the
+			// CPU after a GPU error. VF2_AUTO_MEASURE=1: tests, the old choice by the two times)
 			const double c = g3.cpu_ms, g = g3.gpu_ms;
-			on = was || !g3.last_check ? !(g > 1.5 * c && g > 14.0) : (g <= 1.3 * c || g < 12.0);
+			static const bool measure = getenv("VF2_AUTO_MEASURE") != nullptr;
+			// (a GPU drawn on the CPU, llvmpipe in a container or a VM, measured as before: it's several times slower)
+			on = (!measure && !soft_render) || (was || !g3.last_check ? !(g > 1.5 * c && g > 14.0) : (g <= 1.3 * c || g < 12.0));
+			if (!on && soft_render) on_cpu_because("this computer has no graphics driver for its GPU, so the CPU's own 3D is faster here", "Installing the graphics card's driver puts it on the GPU.");
 			auto_keep(on);
 		}
 		g3.on = on;
@@ -1885,7 +2126,12 @@ int main(int argc, char **argv)
 		SDL_SetWindowTitle(win, title_base);
 		return true;
 	};
-	if (!make_texture()) return fail(std::string("Couldn't make the picture: ") + SDL_GetError());
+	if (!make_texture()) {   // (the GPU's 3D let go first, as at the end: before the renderer whose device it may share)
+		const std::string why = std::string("Couldn't make the picture: ") + SDL_GetError();
+		g3_free();
+		g3.dev.reset();
+		return fail(why);
+	}
 	// Antialiasing: each aa x aa block of the picture drawn averaged into one pixel of what's shown.
 	// Red and blue added together in one word (0x00ff00ff lanes), green in another.
 	auto aa_into = [&](const bitmap_rgb32 &src_bm, uint32_t *dst, size_t stride) {
@@ -2192,6 +2438,11 @@ int main(int argc, char **argv)
 	// it afresh. For this run: what's saved is the player's choice. Not in test runs (VF2_HIDDEN,
 	// VF2_QUIT_AFTER) unless VF2_GOVERN is set.
 	const bool govern = (!hidden && quit_after < 0) || getenv("VF2_GOVERN");
+	// (as VF1's since 18 Oct: no cuts. The player's render scale, antialiasing and smooth motion
+	// always; the governor only turns pipelining on. Its cuts lowered a fast computer whose first
+	// seconds were busy, or whose 3D Auto had put on the CPU, to 1x for the run (vf2-recomp #19).
+	// VF2_GOVERN_CUTS=1: tests, as before)
+	const bool govern_cuts = getenv("VF2_GOVERN_CUTS") != nullptr;
 	struct load_window { uint64_t since = 0, work = 0, frames = 0, starved = 0, worst = 0; int over = 0; bool first = true; int slow = 0; } load;
 	// the ordinary passes of the window (see below, at the end of a pass): time, work, frames,
 	// pictures, the sound running dry; gov_quiet: passes still to skip after a scene change's
@@ -2211,17 +2462,19 @@ int main(int argc, char **argv)
 	// lowered again in this run.
 	float test_screen_hz = 0;   // VF2_SCREEN_HZ=n: tests, the governor's screen as n Hz
 	float screen_hz_now = 0;    // (the screen's refresh as the last 2 s window found it: Auto's spare passes)
+	int vsync_now = -1;         // (the renderer's vsync as it reports it, looked at with the refresh: -1 not yet)
 	uint64_t gov_from = UINT64_MAX;
 	double test_load_ms = 0, test_load_s = 0;   // VF2_TEST_LOAD=ms:s (tests: a slow start)
 	if (const char *tl = getenv("VF2_TEST_LOAD")) sscanf(tl, "%lf:%lf", &test_load_ms, &test_load_s);
 	if (const char *hz = getenv("VF2_SCREEN_HZ")) test_screen_hz = float(atof(hz));
 	int gov_calm = 0;
-	bool gov_raised = false, gov_no_raise = false;
+	bool gov_raised = false;
+	int gov_calm_need = 5;   // calm windows (2 s) before a step back up: doubled each time one doesn't hold, to 30
 	int player_scale = scale, player_aa = aa;   // the scale and antialiasing the governor goes back up to (the player's)
 	// VF2_PACE_LOG's (and F9's) breakdown of a 2 s window: time in each step, passes, pictures, the sound queue
 	// every 10 s, in the log whatever the settings (for a player's log from a machine we can't run):
 	// frames and pictures a second, the load, and a picture's time in each step
-	struct pace_ten { double secs = 0, frames = 0, pictures = 0, work = 0, emu = 0, draw = 0, upload = 0, present = 0, passes = 0; } ten;
+	struct pace_ten { double secs = 0, frames = 0, pictures = 0, work = 0, emu = 0, draw = 0, upload = 0, present = 0, passes = 0, ahead = 0; } ten;   // (ahead: frames run during the present)
 	struct pace_window { uint64_t emu = 0, waited = 0, waited_after = 0, draw = 0, upload = 0, blit = 0, present = 0, delay = 0, passes = 0, pictures = 0, held = 0; int qmin = 1 << 30, qmax = 0; } pace;
 	bool timings = cfg.timings;
 	// Smooth motion (Display > Smooth motion): besides each frame's picture, pictures for the
@@ -2262,7 +2515,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "render state (%s): %dx (drawn at %dx), antialiasing %s, %s %.2f:1, pipelined %s, the 3D on %s, the 2D on the %s (%s), drawn %s, smooth motion %s, governor %s (over %d, short %d), %d threads, vsync %d, frames in flight %d%s, screen %.2f Hz, window %d x %d, i960 %s\n",
 				why, scale, m.render_scale(), aa == 0 ? "Low" : aa_now() > 1 ? (aa_now() == 2 ? "2x" : aa_now() == 3 ? "3x" : "on") : "off", ASPECT_NAMES[aspect_i], m.width() / 372.0,
 				pipelined ? "yes" : "no", r3d, gpu2d || g3.on ? "GPU" : "CPU", rn ? rn : "?", draw_locked ? "into the texture" : "in memory, then sent up", !cfg.smooth ? "off" : smooth_limit ? "on (60 a second)" : "on",
-				govern ? "on" : "off", load.over, load.slow, row_pool::get().threads(), vsync, cfg.frames_in_flight, hints.c_str(), hz, pw, ph,
+				govern_cuts ? "on" : govern ? "pipelining only" : "off", load.over, load.slow, row_pool::get().threads(), vsync, cfg.frames_in_flight, hints.c_str(), hz, pw, ph,
 				!rec ? "interpreted" : rec->nentry ? "native" : "recompiled C++");
 	};
 	// a new render scale or antialiasing: a new picture size
@@ -2274,13 +2527,13 @@ int main(int argc, char **argv)
 			if (cfg.pipelined_at != scale) cfg.pipelined_at = 0;   // (what a run needed at another scale says nothing here)
 			pipelined = pipeline_wanted();            // (and the pipelining, and smooth motion's limit)
 			smooth_limit = false;
-			gov_calm = 0; gov_raised = gov_no_raise = false;
+			gov_calm = 0; gov_raised = false; gov_calm_need = 5;
 		}
 		m.set_render_scale(scale * aa_fit(scale, aa));
 		m.set_edge_aa(aa == 0);
 		if (!make_texture()) { running = false; return; }
 		if (by_player) { player_scale = scale; player_aa = aa; }
-		if (g3.mode == R3D_AUTO) { g3.recheck = true; g3.want_real = false; g3.recheck_why = by_player ? "the player's scale or antialiasing" : "the governor's scale or antialiasing"; }
+		if (g3.mode == R3D_AUTO && (soft_render || getenv("VF2_AUTO_MEASURE"))) { g3.recheck = true; g3.want_real = false; g3.recheck_why = by_player ? "the player's scale or antialiasing" : "the governor's scale or antialiasing"; }   // (Auto measures no more: the GPU)
 		redraw_shown();   // the picture on show, at the new size
 		log_state(by_player ? "the player's scale or antialiasing" : "the governor's");
 	};
@@ -2290,27 +2543,52 @@ int main(int argc, char **argv)
 		present_shape();
 		redraw_shown();   // the picture on show, at the new shape (the 3D's lists set up again for the width)
 		load = load_window{ SDL_GetTicksNS() }; gov = gov_window{};
-		if (g3.mode == R3D_AUTO) { g3.recheck = true; g3.want_real = false; g3.recheck_why = "a new shape"; }
+		if (g3.mode == R3D_AUTO && (soft_render || getenv("VF2_AUTO_MEASURE"))) { g3.recheck = true; g3.want_real = false; g3.recheck_why = "a new shape"; }
 		pipelined = pipeline_wanted();
 		smooth_limit = false;
 		log_state("a new shape");
+	};
+	// The player's own change of a setting the governor looks at (scale, antialiasing, smooth
+	// motion, shape, fullscreen): every cut it made lifted and the governor started afresh. (Only
+	// the changed setting's own was: smooth motion held to 60 stayed when the scale went down, and
+	// a lowered scale stayed when the antialiasing changed, until 10 calm seconds judged against
+	// the old settings, which might never come.)
+	auto gov_fresh = [&] {
+		if (scale != player_scale || aa != player_aa) { aa = player_aa; set_scale(player_scale); }   // (by the player: all of it afresh)
+		load = load_window{ SDL_GetTicksNS() }; gov = gov_window{};
+		smooth_limit = false;
+		gov_calm = 0; gov_raised = false; gov_calm_need = 5;
 	};
 	auto set_shape = [&](int v) {
 		aspect_i = cfg.aspect = v; cfg_dirty = true;
 		apply_aspect();
 		reshape();   // (the title too)
+		gov_fresh();
 	};
 	auto set_fullscreen = [&](bool on) {
 		cfg.fullscreen = on; cfg_dirty = true;
 		SDL_SetWindowFullscreen(win, on);
 		SDL_SyncWindow(win);     // macOS animates into fullscreen: wait for it to finish
+		gov_fresh();
 	};
+	// The game on a thread of its own while the screen waits (VF3's job_start and job_wait, VF1's
+	// game thread): with smooth motion, a frame that will be due by the next refresh is run during
+	// the present's wait for vsync, its inputs set as the frame before it ended (as ever); what
+	// follows it (scene sync, its sound, the next frame's inputs, the hotkeys) as the present
+	// returns, and its picture drawn at the next pass, as if it had run there. Meanwhile nothing
+	// else touches the board: the present only, a picture drawn alongside (pipelined) going on as
+	// it does beside any frame. The same frames, the same pictures. VF2_NO_EMU_THREAD=1: off.
+	const bool emu_threaded = getenv("VF2_NO_EMU_THREAD") == nullptr;
+	fprintf(stderr, "the game's thread: %s\n", emu_threaded ? "on (with smooth motion, the next frame run during the present's wait)" : "off (VF2_NO_EMU_THREAD)");
+	background_job emu_job;
+	struct { bool carried = false, into = false, held = false; } ahead;   // (that frame's picture, for the next pass)
 	// Reset (the menu, F3): the menu closes, a paused game unpauses, and the screen goes black at
 	// once while the boot runs unseen, not the last picture held.
 	// the arcade settings as their page opened (and the ring): see arcade_page
 	std::optional<std::array<int, 9>> assign_before;
 	auto reset_game = [&] {
 		finish_async(false);
+		ahead = {};   // (a frame run during the last present: its picture not drawn)
 		shown_pic.reset();
 		assign_before.reset();   // a restart applies them
 		menu.close();
@@ -2320,7 +2598,7 @@ int main(int argc, char **argv)
 		SDL_RenderPresent(ren);
 		boot();
 		g_test_frames = 0;
-		save_nvram();
+		save_nvram(false);
 		fprintf(stderr, "the game restarted\n");
 		std::vector<uint32_t> black(size_t(m.width()) * scale * model2a::HEIGHT * scale, 0xff000000);
 		SDL_UpdateTexture(tex, nullptr, black.data(), m.width() * scale * 4);
@@ -2332,7 +2610,7 @@ int main(int argc, char **argv)
 	auto save_settings = [&] {
 		cfg.aspect = aspect_i;
 		cfg.timings = timings;
-		cfg.save(settings_path);
+		return cfg.save(settings_path);
 	};
 	auto on_off = [](bool b) { return std::string(b ? "On" : "Off"); };
 	auto wrap = [](int v, int n) { return (v % n + n) % n; };
@@ -2365,14 +2643,15 @@ int main(int argc, char **argv)
 				static const int ORDER[] = { 1, 0, 2, 3 };   // Off, Low, 2x, 3x (as vf1-recomp)
 				int i = 0;
 				while (i < 3 && ORDER[i] != cfg.aa) i++;
-				cfg.aa = ORDER[std::clamp(i + d, 0, 3)]; aa = cfg.aa; set_scale(scale);
+				cfg.aa = ORDER[std::clamp(i + d, 0, 3)]; aa = cfg.aa; set_scale(player_scale);   // (a scale the governor lowered: the player's again)
 			} });
 		p.items.push_back({ "3D renderer",
-			"Which part of your computer draws the 3D. Auto uses the GPU unless it is too slow on this computer (it checks quietly, without interrupting play). CPU and GPU draw the same picture; the GPU frees the processor.",
+			"Which part of your computer draws the 3D. Auto uses the GPU whenever it draws correctly here (it checks as the game starts). CPU and GPU draw the same picture; the GPU is faster and frees the processor. If the GPU closed the game as it started, the CPU draws it until you choose again here.",
 			[&] {
 #if !defined(VF2_GPU3D_METAL) && !defined(VF2_GPU3D_SDL)
 				return std::string("CPU (no GPU support in this build)");
 #endif
+				if (!g3.dev && gpu_crashed) return std::string("CPU (GPU crashed: choose to retry)");
 				if (!g3.dev && g3.next_start && g3.mode != R3D_CPU) return std::string(R3D_NAMES[g3.mode]) + " (from the next start)";
 				if (!g3.dev) return std::string(g3.mode == R3D_CPU ? "CPU" : g3.tried ? "CPU (no GPU support here)" : R3D_NAMES[g3.mode]);
 				if (g3.mode == R3D_AUTO) return std::string("Auto (") + (g3.on ? "GPU" : "CPU") + ")";
@@ -2382,17 +2661,39 @@ int main(int argc, char **argv)
 #if !defined(VF2_GPU3D_METAL) && !defined(VF2_GPU3D_SDL)
 				return;   // (no GPU's 3D: the setting kept as it is)
 #endif
-				static const int ORDER[] = { R3D_AUTO, R3D_CPU, R3D_GPU };
-				int i = 0;
-				while (i < 2 && ORDER[i] != g3.mode) i++;
-				g3.mode = cfg.renderer3d = ORDER[wrap(i + d, 3)]; cfg_dirty = true;
-				cfg.gpu3d_failed.clear();   // (the player's choice: every GPU driver tried again from the next start)
+				// (after a crashed start the first press only tries the GPU again, the setting kept: one press on to CPU
+				// would have left it there)
+				if (!gpu_crashed) {
+					static const int ORDER[] = { R3D_AUTO, R3D_CPU, R3D_GPU };
+					int i = 0;
+					while (i < 2 && ORDER[i] != g3.mode) i++;
+					g3.mode = cfg.renderer3d = ORDER[wrap(i + d, 3)]; cfg_dirty = true;
+				}
+				cfg.gpu3d_failed.clear();   // (the player's choice: every GPU driver tried again from the next start, a crashed start too)
+				cfg.auto3d.clear();   // (and Auto's choices made again)
+				cfg_dirty = true;
+				SDL_RemovePath((data + "/gpu-start.crashed").c_str());
+				gpu_crashed = false;
+				menu.toast("");   // (its advice followed: the notice taken down)
 				finish_async(false);
 				if (g3.mode != R3D_CPU) g3_start();
 				g3_decide("the player's choice", true);   // (the menu's open: nothing moves)
 				redraw_shown();
 				log_state("the player's 3D renderer");
 			} });
+#ifdef _WIN32
+		p.items.push_back({ "Graphics driver",
+			"Which of Windows' graphics drivers the GPU uses. Auto starts on Vulkan, and on Direct3D 12 if Vulkan won't start or can't draw the game's 3D. Pick Direct3D 12 if the game runs better on it here. Takes effect the next time the game starts.",
+			[&] { return std::string(cfg.graphics ? "Direct3D 12" : "Auto (Vulkan first)"); },
+			[&](int) {
+				cfg.graphics = !cfg.graphics; cfg_dirty = true;
+				SDL_RemovePath((data + "/gpu-start.crashed").c_str());   // (another driver: a crashed start tried again with it)
+				gpu_crashed = false;
+				cfg.gpu3d_failed.clear();   // (and the drivers' failures forgotten: they'd choose the order over this)
+				cfg.auto3d.clear();
+				menu.toast("");
+			} });
+#endif
 		if (g3.dev && !strcmp(g3.dev->name(), "metal")) p.items.push_back({ "GPU quality",
 			"Exact draws the 3D on the GPU pixel for pixel as the CPU does. Fast takes shortcuts: quicker on a slow graphics card, with slight differences in texture detail and at edges.",
 			[&] { return std::string(cfg.gpu_quality ? "Fast" : "Exact"); },
@@ -2419,7 +2720,7 @@ int main(int argc, char **argv)
 		p.items.push_back({ "Smooth motion",
 			"On: a picture for each refresh of your screen (up to 120 a second), placed between the arcade's 57.5 frames a second, a frame behind them. Off: only the arcade's own frames, as on the cabinet (uneven on most screens).",
 			[&] { return on_off(cfg.smooth); },
-			[&](int) { cfg.smooth = !cfg.smooth; cfg_dirty = true; smooth_limit = false; } });   // (the picture on show stays)
+			[&](int) { cfg.smooth = !cfg.smooth; cfg_dirty = true; gov_fresh(); } });   // (the picture on show stays)
 		p.items.push_back({ "Screen filter",
 			"Scanlines adds the dark lines between the arcade monitor's rows. CRT adds those, the monitor's red, green and blue stripes, and slightly darker corners. The lines need a large window or fullscreen to show.",
 			[&] { return std::string(FILTER_NAMES[cfg.filter]); },
@@ -2447,7 +2748,7 @@ int main(int argc, char **argv)
 				[&] { return on_off(cfg.perf_hints); },
 				[&](int) { cfg.perf_hints = !cfg.perf_hints; cfg_dirty = true; apply_perf_hints(); } });
 #endif
-		p.items.push_back({ "Fullscreen", "Play fullscreen or in a window. (F11)",
+		p.items.push_back({ "Fullscreen", "Play fullscreen or in a window. (F11, F or Alt+Enter)",
 			[&] { return on_off(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN); },
 			[&](int) { set_fullscreen(!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN)); } });
 		p.items.push_back({ "On-screen controls",
@@ -2864,8 +3165,18 @@ int main(int argc, char **argv)
 			fprintf(stderr, "performance hints: none this phone has (Android 13 and up)\n");
 	}
 #endif
+	// Fullscreen: F11, Alt+Enter, or F (F only while no player has it as a control; the menu takes
+	// keys first, so a key being bound there isn't one)
+	auto fullscreen_key = [&](const SDL_KeyboardEvent &k) {
+		if (k.scancode == SDL_SCANCODE_RETURN && (k.mod & SDL_KMOD_ALT)) return true;
+		if (k.scancode != SDL_SCANCODE_F || (k.mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI))) return false;
+		for (const auto &c : cfg.ctl)
+			for (SDL_Scancode s : c.key) if (s == SDL_SCANCODE_F) return false;
+		return true;
+	};
 	while (running) {
 		const int64_t pass = passes++;
+		marker_done(false);
 		const pace_window pace0 = pace;
 		bool pass_cut = false;
 		uint64_t pass_work = 0, pass_starved = 0;
@@ -2921,6 +3232,10 @@ int main(int argc, char **argv)
 				// a page up at a time, like Esc (and the on-screen controls' Menu button opens it)
 				if (menu.is_open()) menu.pop(); else open_menu();
 			}
+			// (F11 and Alt+Enter with the menu open too, unless it's waiting for a key: Alt+Enter was its Enter)
+			else if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && menu.is_open() && !menu.capturing()
+					 && (e.key.scancode == SDL_SCANCODE_F11 || (e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))))
+				set_fullscreen(!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
 			else if (menu.handle_event(e)) continue;
 			else if (e.type == SDL_EVENT_FINGER_DOWN || e.type == SDL_EVENT_FINGER_MOTION ||
 					 e.type == SDL_EVENT_FINGER_UP || e.type == SDL_EVENT_FINGER_CANCELED) {
@@ -2948,7 +3263,7 @@ int main(int argc, char **argv)
 				else if (e.key.scancode == SDL_SCANCODE_F3) reset_game();
 				else if (e.key.scancode == SDL_SCANCODE_F5) set_scale(scale % MAX_SCALE + 1);
 				else if (e.key.scancode == SDL_SCANCODE_F6) set_shape((aspect_i + 1) % N_ASPECTS);
-				else if (e.key.scancode == SDL_SCANCODE_F11) set_fullscreen(!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
+				else if (e.key.scancode == SDL_SCANCODE_F11 || fullscreen_key(e.key)) set_fullscreen(!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
 				else if (e.key.scancode == SDL_SCANCODE_F12) {
 					// F12: the picture as drawn, into Screenshots in the NVRAM folder (numbered, never overwritten)
 					const std::string shots = data + "/Screenshots";
@@ -2969,8 +3284,7 @@ int main(int argc, char **argv)
 			// settings changed in the menu are saved as it closes (not only at quit: a crash or a
 			// force quit would lose them); test runs save nothing
 			if (cfg_dirty && (quit_after < 0 || test_saves)) {
-				save_settings();
-				cfg_dirty = false;
+				if (save_settings()) cfg_dirty = false;   // (else tried again within 3 s)
 			}
 			// the arcade settings are read as the game starts: restart it if one is different
 			if (assign_before) {
@@ -2982,6 +3296,7 @@ int main(int argc, char **argv)
 			pstate[0].back_was = pstate[1].back_was = true;
 			pstate[0].back_combo = pstate[1].back_combo = true;
 			pstate[0].start_was = pstate[1].start_was = true;
+			pstate[0].start_quiet = pstate[1].start_quiet = true;   // (a Start key or button held as it closed)
 			for (pad_state &s : pstate) s.menu_was = s.touch_was = s.sticks_was = true;
 			restart_clock();
 		}
@@ -2991,6 +3306,7 @@ int main(int argc, char **argv)
 		bool held = false;                // the newest frame held back by scene sync
 		const bool ff = !stopped && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_TAB];   // Tab held: flat out
 		const uint64_t work_t0 = SDL_GetTicksNS();
+		bool sound_full = false;   // over 300 ms queued: no frames run this pass
 		if (stopped) restart_clock();
 		else {
 			// how many frames to run now
@@ -2999,7 +3315,6 @@ int main(int argc, char **argv)
 			clock_t = now_ns;
 			double rate = FRAME_HZ;
 			int low = 0;   // frames the sound queue needs at once
-			bool sound_full = false;   // over 300 ms queued: no frames run this pass
 			if (audio && m.sound()) {
 				const int q = SDL_GetAudioStreamQueued(audio);
 				// a sound device that stopped taking sound without going away, or takes it slower than
@@ -3034,22 +3349,18 @@ int main(int argc, char **argv)
 			else if (sound_full) { due = 0; frame_clock = std::min(frame_clock, double(frames_run) + 1); }   // (the clock held at the next frame)
 			frames_run += due;
 		}
-		for (int i = 0; i < due && running; i++) {
-			// Behind (several frames to run at once), only the last is drawn: the others wouldn't be
-			// seen. (The 3D of a frame not drawn is drawn with the next, as MAME draws it; with scene
-			// sync every frame's 3D is set up, as it may be shown two frames on, and drawn if it is.)
-			const bool last = i == due - 1 || script.shots.count(game_frame) ||
-				(quit_after >= 0 && int64_t(game_frame) + 1 >= quit_after);
-			if (audio && !ff && SDL_GetAudioStreamQueued(audio) == 0 && shown) load.starved++, pass_starved++;
+		// a frame run on the board: here, or on the game's thread during the present (see emu_job)
+		auto run_one = [&](bool last) {
 			m.set_draw_3d(last || sync.enabled);
-			const uint64_t te = SDL_GetTicksNS(), waited = m.render_waited_ns();
 			if (test_stage >= 0 && (m.game_mode() == 7 || m.game_mode() == 8))   // VF2_STAGE (tests: the fight's stage)
 				const_cast<std::vector<u8> &>(m.workram())[0x64] = u8(test_stage);
 			m.run_frame();
-			sysinfo::note_frame();
-			pace.emu += SDL_GetTicksNS() - te;
-			pace.waited += m.render_waited_ns() - waited;   // (pipelined: the last picture still being drawn)
+			sysinfo::note_frame();   // (on the thread that ran it)
 			m.set_draw_3d(true);
+		};
+		// what follows a frame, here: scene sync, the picture to draw (into, held_now), the next frame's
+		// inputs, its sound, the hotkeys (false: no more frames this pass, the menu opened or a restart)
+		auto frame_done = [&](bool last, bool &into, bool &held_now) -> bool {
 			if (test_ko.player && game_frame >= test_ko.from && game_frame <= test_ko.to && m.workram()[0x2b] == 9 && m.workram()[0x31] == 9) {
 				const u32 block = test_ko.player == 1 ? 0x510980 : 0x512980;   // (as vf2run's --ko)
 				if (int16_t(m.peek32(block + 0x1ac)) > 0 && !(m.peek32(block) & 0x20)) {
@@ -3062,15 +3373,15 @@ int main(int argc, char **argv)
 			const bool show = sync.show(m);   // (every frame: it follows the scene)
 			if (show && !last_shown) m.smooth_cut();   // (a hold over: the new scene isn't blended from the old)
 			last_shown = show;
-			held = last && !show;
-			hold_on = held;
+			held_now = last && !show;
+			hold_on = held_now;
 			if (last && script.shots.count(game_frame)) {   // a shot to write: as a bitmap
 				const uint64_t td = SDL_GetTicksNS();
 				show_drawn(m.render(true));
 				pace.draw += SDL_GetTicksNS() - td;
-				draw_into_texture = false;
+				into = false;
 			} else if (last) {
-				draw_into_texture = show;
+				into = show;
 				// (held: a picture made meanwhile, at a new size, still goes up; pipelined too, as this
 				// frame's goes up only at the next pass: else the new size's texture, still empty, shows)
 				if (show && !pipelined) new_picture = false;
@@ -3105,10 +3416,27 @@ int main(int argc, char **argv)
 			// leaving the service menu: the PC way restarts at once, past the boot
 			if (g_left_test_menu) {
 				g_left_test_menu = false;
-				if (g_pc_mode) { reset_game(); draw_into_texture = held = false; break; }
+				if (g_pc_mode) { reset_game(); into = held_now = false; return false; }
 				m.set_ring_width(cfg.ring);   // (the test mode sets the ring by the difficulty)
 			}
-			if (menu.is_open()) { draw_into_texture = show; held = !show; break; }   // (this frame is the one on show)
+			if (menu.is_open()) { into = show; held_now = !show; return false; }   // (this frame is the one on show)
+			return true;
+		};
+		// the frame run during the last present: its picture drawn now, as if it had run here
+		const bool took_ahead = ahead.carried;   // (counted as a frame run in this pass, below)
+		if (took_ahead) { draw_into_texture = ahead.into; held = ahead.held; ahead.carried = false; }
+		for (int i = 0; i < due && running; i++) {
+			// Behind (several frames to run at once), only the last is drawn: the others wouldn't be
+			// seen. (The 3D of a frame not drawn is drawn with the next, as MAME draws it; with scene
+			// sync every frame's 3D is set up, as it may be shown two frames on, and drawn if it is.)
+			const bool last = i == due - 1 || script.shots.count(game_frame) ||
+				(quit_after >= 0 && int64_t(game_frame) + 1 >= quit_after);
+			if (audio && !ff && SDL_GetAudioStreamQueued(audio) == 0 && shown) load.starved++, pass_starved++;
+			const uint64_t te = SDL_GetTicksNS(), waited = m.render_waited_ns();
+			run_one(last);
+			pace.emu += SDL_GetTicksNS() - te;
+			pace.waited += m.render_waited_ns() - waited;   // (pipelined: the last picture still being drawn)
+			if (!frame_done(last, draw_into_texture, held)) break;
 		}
 		if (audio) { const int q = SDL_GetAudioStreamQueued(audio); pace.qmin = std::min(pace.qmin, q); pace.qmax = std::max(pace.qmax, q); }
 		// Auto's check again, a turn at a time (a picture each way) where it can't be seen: at a
@@ -3116,11 +3444,11 @@ int main(int argc, char **argv)
 		// time to spare (no frame run, and the turn, as long as the last, well within the screen's
 		// refresh: a picture between frames still goes up in time). A switch only at a quiet moment.
 		for (int64_t at : g3.recheck_at) if (at == pass) { g3.recheck = true; g3.recheck_why = "a test (VF2_AUTO_RECHECK)"; }
-		const bool quiet = stopped || held || (hold_on && due == 0);
+		const bool quiet = stopped || held || (hold_on && due == 0 && !took_ahead);
 		if (g3.recheck && (g3.mode == R3D_AUTO || (g3.verify && g3.mode == R3D_GPU)) && g3.dev && !g3.failed && (!g3.want_real || m.polygons_drawn(0) >= 400)) {
 			const double refresh_ms = 1000.0 / (hidden || !screen_hz_now ? 120.0 : std::min(240.0f, screen_hz_now));
 			const double turn = g3.b.active && g3.b.last_turn > 0 ? g3.b.last_turn : std::max(1.0, g3.gpu_ms);
-			const bool spare = !stopped && due == 0 && !async_pending && turn > 0 && double(SDL_GetTicksNS() - pass_t0) / 1e6 + turn < 0.4 * refresh_ms;
+			const bool spare = !stopped && due == 0 && !took_ahead && !async_pending && turn > 0 && double(SDL_GetTicksNS() - pass_t0) / 1e6 + turn < 0.4 * refresh_ms;
 			if (quiet || spare || g3.anytime || g3.verify) {   // (SDL_GPU's check of its pictures: whenever, a turn a pass)
 				const bool was = g3.on;
 				const uint64_t tc = SDL_GetTicksNS();
@@ -3165,10 +3493,14 @@ int main(int argc, char **argv)
 		float alpha = 1;
 		{
 			const uint64_t bt = SDL_GetTicksNS();
-			smooth_budget = std::min(2.0, smooth_budget + double(bt - smooth_budget_t) * (smooth_limit ? 60 : 120) / 1e9);
+			// (a picture each refresh: the screen's rate when it's faster than 120, as VF1's; only while vsync
+			// is on: off, forced so in a driver's settings, nothing paces the passes to the screen, 120 a
+			// second then, as VF1's and VF3's)
+			const double smooth_rate = smooth_limit ? 60.0 : vsync_now != 0 ? std::max(120.0, double(screen_hz_now) + 1.0) : 120.0;
+			smooth_budget = std::min(2.0, smooth_budget + double(bt - smooth_budget_t) * smooth_rate / 1e9);
 			smooth_budget_t = bt;
 			const bool unseen = !hidden && (SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED));
-			if (smooth_on() && !stopped && !ff && last_shown && !held && !unseen && (draw_into_texture || (due == 0 && smooth_budget >= 1))) {
+			if (smooth_on() && !stopped && !ff && last_shown && !held && !unseen && (draw_into_texture || (due == 0 && !took_ahead && smooth_budget >= 1))) {
 				smooth_now = true;
 				smooth_budget = std::max(0.0, smooth_budget - 1);
 				alpha = float(std::clamp(frame_clock - double(frames_run), 0.0, 1.0));
@@ -3344,7 +3676,7 @@ int main(int argc, char **argv)
 			new_picture = false;
 			new_shown = !stopped;
 		}
-		if (due || smooth_now) {
+		if (due || took_ahead || smooth_now) {
 			if (test_load_ms > 0 && gov_from != UINT64_MAX && SDL_GetTicksNS() < gov_from - 10000000000ull + uint64_t(test_load_s * 1e9))
 				for (const uint64_t until = SDL_GetTicksNS() + uint64_t(test_load_ms * 1e6 * std::max(due, 1) * scale * scale / 9); SDL_GetTicksNS() < until;) {}   // VF2_TEST_LOAD
 			const uint64_t w = SDL_GetTicksNS() - work_t0;
@@ -3358,6 +3690,12 @@ int main(int argc, char **argv)
 		// counts as shown: the screen kept its pace, and counting it as missed showed a drop to
 		// 80-odd at every scene change)
 		if (new_shown || (hold_on && !stopped && !menu.is_open())) fps_shown++;
+		// (the 3D on the CPU with the setting not CPU: why, on screen once)
+		if (cpu_why_new) {
+			cpu_why_new = false;
+			menu.toast("The 3D is on the CPU: " + cpu_why, 12);
+			fprintf(stderr, "the notice: The 3D is on the CPU: %s\n", cpu_why.c_str());   // (in the log too: what the player was told)
+		}
 		if (const uint64_t now = SDL_GetTicksNS(); now - fps_since >= 500000000) {
 			menu.set_fps(cfg.show_fps ? std::to_string(int(std::lround(fps_shown * 1e9 / double(now - fps_since)))) + " FPS" : "");
 			fps_shown = 0;
@@ -3392,7 +3730,7 @@ int main(int argc, char **argv)
 			write_png("build/host_last.png", picture->data(), picture->width(), picture->height());
 			write_window("build/host_window.png");
 		}
-		if (window_shot && due && game_frame >= window_shot + 3) {   // (a new shape's texture filled by then)
+		if (window_shot && (due || took_ahead) && game_frame >= window_shot + 3) {   // (a new shape's texture filled by then)
 			write_window(("build/host_window_" + std::to_string(window_shot) + ".png").c_str());
 			window_shot = 0;
 		}
@@ -3436,6 +3774,23 @@ int main(int argc, char **argv)
 				(unsigned long long)flicker.pics, (unsigned long long)flicker.total, flicker.pics ? double(flicker.total) / flicker.pics : 0.0, (unsigned long long)flicker.worst);
 		for (int64_t at : shots_at)
 			if (at == pass) write_window(("build/host_window_at_" + std::to_string(at) + ".png").c_str());
+		// the next frame, if it will be due by the next refresh, run on the game's thread while this
+		// present waits (see emu_job): not for a frame whose picture the test run writes, nor its last
+		bool ran_ahead = false;
+		uint64_t ahead_ns = 0, ahead_waited = 0;
+		if (emu_threaded && running && shown && smooth_on() && !paused && !menu.is_open() && !ff && !sound_full &&
+			!script.shots.count(game_frame) && !(quit_after >= 0 && int64_t(game_frame) + 1 >= quit_after) &&
+			frame_clock + FRAME_HZ / (hidden || screen_hz_now <= 0 ? 120.0 : double(screen_hz_now)) >= double(frames_run + 1)) {
+			if (audio && SDL_GetAudioStreamQueued(audio) == 0) load.starved++, pass_starved++;
+			frames_run++;
+			ran_ahead = true;
+			emu_job.start([&] {
+				const uint64_t te = SDL_GetTicksNS(), waited = m.render_waited_ns();
+				run_one(true);
+				ahead_ns = SDL_GetTicksNS() - te;
+				ahead_waited = m.render_waited_ns() - waited;
+			});
+		}
 		const uint64_t tp = SDL_GetTicksNS();
 		SDL_RenderPresent(ren);
 		pace.present += SDL_GetTicksNS() - tp;
@@ -3464,6 +3819,17 @@ int main(int argc, char **argv)
 			const uint64_t t = SDL_GetTicksNS();
 			if (next > t) SDL_DelayNS(next - t); else next = t;
 		}
+		if (ran_ahead) {   // the frame run meanwhile: what follows it, here (its time counted as the pass's work)
+			emu_job.wait();
+			pace.emu += ahead_ns;
+			pace.waited += ahead_waited;
+			load.work += ahead_ns;
+			pass_work += ahead_ns;
+			load.worst = std::max(load.worst, ahead_ns);
+			ten.ahead++;
+			ahead.carried = true;
+			frame_done(true, ahead.into, ahead.held);
+		}
 		// Started from a terminal, the window can open behind it or without the keyboard (the keys go
 		// to the terminal): it asks for it over about 5 s, and the log says whether it got it.
 		if (focus_checks > 0 && !hidden && shown) {
@@ -3486,11 +3852,11 @@ int main(int argc, char **argv)
 			else {
 				gov.time += SDL_GetTicksNS() - pass_t0;
 				gov.work += pass_work;
-				gov.frames += uint64_t(due);
+				gov.frames += uint64_t(due + ran_ahead);
 				gov.pictures += new_shown;
 				gov.starved += pass_starved;
 				pipe_look.work += pass_work;
-				pipe_look.frames += uint64_t(due);
+				pipe_look.frames += uint64_t(due + ran_ahead);
 				if (pipe_look.frames >= 30) {
 					const double cost = double(pipe_look.work) / 1e6 / double(pipe_look.frames);
 					if (govern && pipeline_force < 0 && !pipelined && aa_now() == 1 && shown && cost > 0.85 * 1000.0 / FRAME_HZ) {
@@ -3544,6 +3910,12 @@ int main(int argc, char **argv)
 			if (const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(win))) if (!hidden && dm->refresh_rate > 0) screen_hz = dm->refresh_rate;
 			if (test_screen_hz > 0) screen_hz = test_screen_hz;
 			screen_hz_now = screen_hz;
+			{   // (the log says when it's on or off)
+				int vs = 0;
+				const int on = SDL_GetRenderVSync(ren, &vs) && vs != 0;
+				if (on != vsync_now) fprintf(stderr, "vsync: %s\n", on ? "on" : "off (smooth pictures 120 a second, not one each refresh)");
+				vsync_now = on;
+			}
 			if (smooth_on()) enough = std::max(55.0, std::min<double>(screen_hz, smooth_limit ? 60 : 120) * 0.9);
 			// Judged on the window's ordinary passes only (gov), and only when they're most of it: a
 			// window taken up by scene changes says nothing either way (its streaks stay as they were)
@@ -3560,7 +3932,7 @@ int main(int argc, char **argv)
 			const bool slow = steady_short || (judged && (gfps < 56.5 || gshown < enough) && gbusy > 0.6);
 			const bool over = judged && (gbusy > 0.9 || (gov.starved > 0 && gbusy > 0.6));
 			// Auto: pictures short, the other renderer checked at the next quiet moment (at most every 20 s)
-			if (g3.mode == R3D_AUTO && g3.dev && !g3.failed && !g3.recheck && (slow || over) && t - g3.last_check > 20000000000ull) {
+			if (g3.mode == R3D_AUTO && (soft_render || getenv("VF2_AUTO_MEASURE")) && g3.dev && !g3.failed && !g3.recheck && (slow || over) && t - g3.last_check > 20000000000ull) {
 				g3.recheck = true; g3.recheck_why = "the pictures short";
 			}
 			// Pipelining: on when running a frame and drawing its pictures takes over 85% of a frame's
@@ -3584,9 +3956,9 @@ int main(int argc, char **argv)
 			// then, before antialiasing and the scale, smooth motion's pictures limited to 60 a second
 			// (not on a screen of 60 Hz or less: a picture for each refresh is no more than 60 a second
 			// there, and a budget of 60 a second would leave some refreshes without one)
-			if (govern && !stepped && smooth_on() && !smooth_limit && screen_hz > 65 && judged && (slow_windows >= 3 || (over && load.over + 1 >= 3))) {
+			if (govern_cuts && !stepped && smooth_on() && !smooth_limit && screen_hz > 65 && judged && (slow_windows >= 3 || (over && load.over + 1 >= 3))) {
 				smooth_limit = stepped = true;
-				if (gov_raised) gov_no_raise = true;   // (lifted, then short again: kept this run)
+				if (gov_raised) { gov_calm_need = std::min(30, gov_calm_need * 2); gov_raised = false; }   // (lifted, then short again: the next lift waits longer, never for good)
 				gov_note += "gov:smooth60,";
 				fprintf(stderr, "%.1f frames a second, %.1f shown, busy %.0f%% of the time: smooth pictures limited to 60 a second\n", fps, shown_fps, busy * 100);
 				log_state("the governor's");
@@ -3595,7 +3967,7 @@ int main(int argc, char **argv)
 			else load = load_window{ t, 0, 0, 0, 0, load.over, stopped, load.slow };   // (not judged: the streaks as they were)
 			gov = gov_window{};
 			// (six seconds of ordinary play short of pictures, or eight over-busy: a lasting load)
-			if (govern && !stepped && judged && (load.slow >= 3 || load.over >= 4) && (aa_now() > 1 || aa == 0 || scale > 1)) {
+			if (govern_cuts && !stepped && judged && (load.slow >= 3 || load.over >= 4) && (aa_now() > 1 || aa == 0 || scale > 1)) {
 				if (aa_now() > 1 || aa == 0) {
 					fprintf(stderr, "%.1f frames a second, %.1f shown, busy %.0f%% of the time: antialiasing off\n", fps, shown_fps, busy * 100);
 					aa = 1;
@@ -3608,7 +3980,7 @@ int main(int argc, char **argv)
 				gov_note += "gov:lowered,";
 				load.over = load.slow = 0;
 				gov_calm = 0;
-				if (gov_raised) gov_no_raise = true;   // (a step back up that didn't hold: no more this run)
+				if (gov_raised) { gov_calm_need = std::min(30, gov_calm_need * 2); gov_raised = false; }   // (a step back up that didn't hold: the next waits longer)
 			}
 			// (calm: the frames and pictures all there, busy under 55% of the time)
 			const bool calm = judged && !slow && !over && gbusy < 0.55 && gfps >= 56.5 && gshown >= enough;
@@ -3616,7 +3988,7 @@ int main(int argc, char **argv)
 			// (2026-10-14, vf2-recomp #3: an RTX 5080 at 6x was limited to 60 by a slow first few seconds, then
 			// sat at 40% busy for minutes, still at 60: a limit is lifted again once things are calm, the
 			// smooth pictures' first, and a limit that comes straight back stays)
-			if (govern && !stepped && gov_calm >= 5 && !gov_no_raise && smooth_limit && scale == player_scale && aa == player_aa) {
+			if (govern_cuts && !stepped && gov_calm >= gov_calm_need && smooth_limit && scale == player_scale && aa == player_aa) {
 				fprintf(stderr, "%.1f frames a second, %.1f shown, busy %.0f%% of the time: smooth pictures no longer limited to 60\n", fps, shown_fps, busy * 100);
 				smooth_limit = false;
 				gov_note += "gov:smooth-all,";
@@ -3625,7 +3997,7 @@ int main(int argc, char **argv)
 				load.over = load.slow = 0;
 				log_state("the governor's");
 			} else
-			if (govern && !stepped && gov_calm >= 5 && !gov_no_raise && (scale < player_scale || aa != player_aa)) {
+			if (govern_cuts && !stepped && gov_calm >= gov_calm_need && (scale < player_scale || aa != player_aa)) {
 				if (scale < player_scale) {
 					fprintf(stderr, "%.1f frames a second, %.1f shown, busy %.0f%% of the time: render scale back up to %dx\n", fps, shown_fps, busy * 100, scale + 1);
 					set_scale(scale + 1, false);
@@ -3652,9 +4024,11 @@ int main(int argc, char **argv)
 			}
 			if (ten.secs >= 10) {
 				const double pics = std::max(1.0, ten.pictures), passes = std::max(1.0, ten.passes);
-				fprintf(stderr, "pace: %.1f frames/s, %.1f pictures/s (screen %.2f Hz), busy %.0f%%; a picture: run %.2f ms, draw %.2f%s, upload %.2f; a pass: present %.2f ms; %dx%s\n",
+				char thr[64] = ", the game's thread off";   // (on: its share of the frames)
+				if (emu_threaded) snprintf(thr, sizeof thr, ", %.0f%% of the frames run during the present", 100.0 * ten.ahead / std::max(1.0, ten.frames));
+				fprintf(stderr, "pace: %.1f frames/s, %.1f pictures/s (screen %.2f Hz), busy %.0f%%; a picture: run %.2f ms, draw %.2f%s, upload %.2f; a pass: present %.2f ms; %dx%s%s\n",
 						ten.frames / ten.secs, ten.pictures / ten.secs, screen_hz, ten.work / (ten.secs * 10), ten.emu / pics, ten.draw / pics, pipelined ? " (alongside)" : "",
-						ten.upload / pics, ten.present / passes, scale, !smooth_on() ? ", smooth off" : "");
+						ten.upload / pics, ten.present / passes, scale, !smooth_on() ? ", smooth off" : "", thr);
 				if (const std::string where = sysinfo::placement(); !where.empty()) fprintf(stderr, "  %s\n", where.c_str());
 				if (const std::string clocks = sysinfo::cpu_frequencies(); !clocks.empty()) fprintf(stderr, "  the cores at: %s\n", clocks.c_str());
 				if (const std::string gpu_clock = sysinfo::gpu_frequencies(); !gpu_clock.empty()) fprintf(stderr, "  the GPU at: %s\n", gpu_clock.c_str());
@@ -3675,16 +4049,21 @@ int main(int argc, char **argv)
 			next_save = SDL_GetTicksNS() + 3000000000ull;
 			// a setting changed outside the menu (F5, F6, a pad's View + LB or RB): saved within 3 s,
 			// not only at quit (Steam can end the game without one)
-			if (cfg_dirty && !menu.is_open() && (quit_after < 0 || test_saves)) { save_settings(); cfg_dirty = false; }
-			save_nvram();
+			if (cfg_dirty && !menu.is_open() && (quit_after < 0 || test_saves)) { if (save_settings()) cfg_dirty = false; }
+			// the backup within a minute of changing (every 3 s before: the arcade's bookkeeping
+			// changes it in play, so it was written that often; and at quit as ever)
+			static uint64_t next_nvram = SDL_GetTicksNS() + 60000000000ull;
+			if (SDL_GetTicksNS() >= next_nvram) { next_nvram = SDL_GetTicksNS() + 60000000000ull; save_nvram(false); }
 		}
 	}
 	finish_async(false);
-	save_nvram();
+	saver.finish();   // (an autosave still being written, done before the last save: the same files)
+	save_nvram(true);
 	if (cfg_dirty && (quit_after < 0 || test_saves)) save_settings();
 	for (auto &[id, j] : vpads) { if (j) SDL_CloseJoystick(j); SDL_DetachVirtualJoystick(id); }
 	g3_free();
 	g3.dev.reset();   // (the GPU's 3D before the renderer whose device it may share)
+	marker_done(true);
 	SDL_Quit();
 	return 0;
 }

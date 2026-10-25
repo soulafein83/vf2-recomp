@@ -58,6 +58,7 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 BSD
 sec "SLJIT, Zoltan Herczeg (BSD-2-Clause): the native code the game is recompiled to"; cat third_party/sljit/LICENSE
 sec "RmlUi (MIT)"; cat third_party/rmlui/LICENSE.txt
+sec "robin_hood and itlib (MIT), built into RmlUi"; cat third_party/rmlui/Include/RmlUi/Core/Containers/LICENSE.txt
 sec "stb_image, Sean Barrett (MIT option)"; sed -n '/ALTERNATIVE A - MIT License/,/^SOFTWARE\.$/p' third_party/stb/stb_image.h
 sec "SDL 3 (zlib)"; tar xzf $D/SDL3.tar.gz -O SDL3-3.4.18/LICENSE.txt
 sec "FreeType (FreeType License)"

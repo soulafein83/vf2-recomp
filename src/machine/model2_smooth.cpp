@@ -593,10 +593,17 @@ void model2_video::replay_into(const moment &mo, std::vector<drawn_poly> &drawn)
 				m_blend_ok[k] = 1;
 				m_smooth_stats[2]++;
 			}
+			// (a light that changes in kind between the frames isn't blended: the nearer frame's.
+			// The game's flashes swap the usual light, about 1 long, for one thousands long for a
+			// frame or two: blended, 0.1% of it swamped the other, and the fighters in the pictures
+			// between a bright frame and a dark one were bright again, Pai pink on a dark stage)
 			if (a->lights.size() == b->lights.size())
 				for (size_t k = 0; k < b->lights.size(); k++) {
+					const auto &la = a->lights[k], &lb = b->lights[k];
+					const float na = la[0] * la[0] + la[1] * la[1] + la[2] * la[2], nb2 = lb[0] * lb[0] + lb[1] * lb[1] + lb[2] * lb[2];
 					std::array<float, 3> l;
-					for (int e = 0; e < 3; e++) l[e] = a->lights[k][e] + (b->lights[k][e] - a->lights[k][e]) * alpha;
+					if (na > 16 * nb2 || nb2 > 16 * na) l = alpha < 0.5f ? la : lb;
+					else for (int e = 0; e < 3; e++) l[e] = la[e] + (lb[e] - la[e]) * alpha;
 					m_light_blend.push_back(l);
 				}
 			if (a->focals.size() == b->focals.size())

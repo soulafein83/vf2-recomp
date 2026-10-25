@@ -23,6 +23,9 @@ recompiler, MAME's Model 2A board, the renderers and the desktop builds are upst
 the phone only. For everything else, from the desktop downloads to the controls and the credits, see the
 [upstream README](https://github.com/mr-finster/vf2-recomp#readme).
 
+The fork is based on upstream **v0.1.15**: upstream's GPU fallback and crash handling, background saves,
+fullscreen keys and the rest of v0.1.10–v0.1.15 are in, and every Android addition is kept on top of them.
+
 The port in more detail: [android/README.md](android/README.md) (the same instructions as below, for a
 player: build, install, ROM, controls), [vf2.md](vf2.md) (the port's plan and every phone run's numbers,
 module by module), [docs/ARM-IMMORTALIS-G720.md](docs/ARM-IMMORTALIS-G720.md) (what the phone's GPU wants

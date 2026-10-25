@@ -50,6 +50,13 @@ execute_process(COMMAND git log -1 --format=%cd --date=short
 if(NOT VF2_DATE)
     set(VF2_DATE "unknown")
 endif()
+# The commit too: what a GPU failure is remembered by (src/host/main.cpp's BUILD).
+execute_process(COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY "${REPO_ROOT}"
+    OUTPUT_VARIABLE VF2_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT VF2_COMMIT)
+    set(VF2_COMMIT "unknown")
+endif()
 configure_file("${CMAKE_CURRENT_LIST_DIR}/version.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/version.h" @ONLY)
 

@@ -10,6 +10,7 @@ tools/mac/build_release.sh
 APP="build/release/Virtua Fighter 2 Recomp.app"
 rm -rf build/release && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/assets"
 cp build/rel/vf2 "$APP/Contents/MacOS/Virtua Fighter 2 Recomp"
+strip -S -x "$APP/Contents/MacOS/Virtua Fighter 2 Recomp"   # (no debug info: it names the build machine's folders)
 cp -R assets/ui assets/fonts assets/backgrounds "$APP/Contents/Resources/assets/"
 cp assets/icon/VF2.icns "$APP/Contents/Resources/VF2.icns"
 VERSION=${VF2_VERSION:-$(git describe --tags --always 2>/dev/null || echo dev)}   # (VF2_VERSION=v0.1.0 for a release)

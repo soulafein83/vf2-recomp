@@ -40,8 +40,9 @@ struct menu_listener : Rml::EventListener
 		menu->select(i);
 		if (ev.GetId() == Rml::EventId::Click) {
 			const menu_item &it = menu->m_stack.back().items[i];
+			Rml::Element *t = ev.GetTargetElement();
 			if (it.activate) menu->activate();
-			else if (it.change) menu->change(+1);
+			else if (it.change) menu->click_change(t && t->IsClassSet("back") ? -1 : +1);   // (the "<" steps back)
 		}
 	}
 };
@@ -77,7 +78,23 @@ void game_menu::set_fps(const std::string &text)
 	if (!m->overlay || text == m_fps) return;
 	m_fps = text;
 	if (Rml::Element *e = m->overlay->GetElementById("fps")) e->SetInnerRML(escape(text));
-	if (text.empty() || m_open) m->overlay->Hide(); else m->overlay->Show();   // (not over the menu)
+	show_overlay();
+}
+
+void game_menu::show_overlay()
+{
+	if (!m->overlay) return;
+	if (Rml::Element *e = m->overlay->GetElementById("fps")) e->SetProperty("visibility", m_fps.empty() ? "hidden" : "visible");
+	if (m_open || (m_fps.empty() && !m_toast_until)) m->overlay->Hide(); else m->overlay->Show();   // (not over the menu)
+}
+
+void game_menu::toast(const std::string &text, double seconds)
+{
+	if (!m->overlay) return;
+	if (Rml::Element *e = m->overlay->GetElementById("toast")) e->SetInnerRML(text.empty() ? "" : "<span>" + escape(text) + "</span>");
+	m_toast_until = 0;
+	m_toast_wait = text.empty() ? 0 : seconds;   // (counted from when it can be seen: render)
+	show_overlay();
 }
 
 void game_menu::set_footer(const std::string &text)
@@ -112,14 +129,20 @@ bool game_menu::init(SDL_Window *win, SDL_Renderer *ren, const std::string &asse
 
 void game_menu::open(menu_page root)
 {
+	// (a notice up: hidden with the overlay while the menu is open, the rest of its time counted from when it closes)
+	if (m_toast_until) {
+		const uint64_t now = SDL_GetTicks();
+		if (m_toast_until > now) { m_toast_wait = double(m_toast_until - now) / 1000.0; m_toast_until = 0; }
+		else toast("");
+	}
 	if (!ready()) return;
 	m_stack = { std::move(root) };
 	m_sel_stack.clear();
 	m_sel = first_selectable(m_stack.back());
 	build();
 	m->doc->Show();
-	if (m->overlay) m->overlay->Hide();   // the FPS: not over the menu
 	m_open = true;
+	show_overlay();   // (the FPS and a notice: not over the menu)
 	SDL_ShowCursor();
 }
 
@@ -129,7 +152,7 @@ void game_menu::close()
 	m_capture = nullptr;
 	m->doc->Hide();
 	m_open = false;
-	if (m->overlay && !m_fps.empty()) m->overlay->Show();
+	show_overlay();
 	m_stack.clear();
 	SDL_HideCursor();
 }
@@ -170,7 +193,7 @@ void game_menu::build()
 			   "\" id=\"r" + std::to_string(i) + "\"><span class=\"label\">" + escape(it.label) + "</span>";
 		if (it.value) {
 			rml += "<span class=\"value\">";
-			if (it.change) rml += "<span class=\"arrow\">&lt;&nbsp;&nbsp;</span>";
+			if (it.change) rml += "<span class=\"arrow back\">&lt;&nbsp;&nbsp;</span>";
 			rml += escape(it.value());
 			if (it.change) rml += "<span class=\"arrow\">&nbsp;&nbsp;&gt;</span>";
 			rml += "</span>";
@@ -235,8 +258,27 @@ void game_menu::move(int d)
 	}
 }
 
+// A click on a choice: "<" steps back, the rest of the row forward; at either end a click goes round
+// to the other (choices that stop at their ends, a render scale at 6x or the hardest difficulty, were
+// stuck there for a mouse: every click stepped forward, even on "<". vf3-recomp #3)
+void game_menu::click_change(int d)
+{
+	// (a change that restarts the game closes the menu, a rebuilt page can be shorter: then it's done,
+	// not read from a page that's gone. Play style crashed the game on a click)
+	auto value = [&] {
+		if (m_stack.empty() || size_t(m_sel) >= m_stack.back().items.size()) return std::string("\x01gone");
+		const menu_item &it = m_stack.back().items[m_sel];
+		return it.value ? it.value() : std::string();
+	};
+	const std::string was = value();
+	change(d);
+	if (value() != was) return;
+	for (int n = 0; n < 64; n++) { const std::string at = value(); if (at == "\x01gone") break; change(-d); if (value() == at) break; }
+}
+
 void game_menu::change(int d)
 {
+	if (m_stack.empty() || size_t(m_sel) >= m_stack.back().items.size()) return;   // (no page open: nothing to change)
 	auto f = m_stack.back().items[m_sel].change;   // a copy: it may rebuild the pages
 	if (!f) return;
 	f(d);
@@ -247,6 +289,7 @@ void game_menu::change(int d)
 // Backspace, which go back a page, nor B)
 void game_menu::clear()
 {
+	if (m_stack.empty() || size_t(m_sel) >= m_stack.back().items.size()) return;   // (no page open: nothing to change)
 	auto f = m_stack.back().items[m_sel].clear;
 	if (!f) return;
 	f();
@@ -355,7 +398,10 @@ bool game_menu::handle_event(const SDL_Event &e)
 
 void game_menu::render()
 {
-	if (!m_open && m_fps.empty()) return;
+	if (!m->ctx) return;   // (no menu: its files weren't found)
+	if (m_toast_wait > 0 && !m_open) { m_toast_until = SDL_GetTicks() + uint64_t(m_toast_wait * 1000); m_toast_wait = 0; show_overlay(); }
+	if (m_toast_until && SDL_GetTicks() >= m_toast_until) toast("");
+	if (!m_open && m_fps.empty() && !m_toast_until) return;
 	// the menu is laid out in window pixels, not the game's letterboxed picture
 	int lw = 0, lh = 0;
 	SDL_RendererLogicalPresentation mode = SDL_LOGICAL_PRESENTATION_DISABLED;

@@ -1,5 +1,8 @@
 // A small pool of worker threads for splitting a frame's drawing by rows.
 #pragma once
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
 #include <algorithm>
 #include <condition_variable>
 #include <cstdlib>
@@ -97,6 +100,9 @@ private:
 		if (const char *t = getenv("VF2_THREADS")) n = std::clamp(atoi(t) - 1, 0, 31);   // testing: threads in all
 		for (int i = 0; i < n; i++)
 			m_workers.emplace_back([this] {
+#ifdef __APPLE__
+				pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);   // (the performance cores)
+#endif
 				unsigned seen = 0;
 				for (;;) {
 					std::unique_lock<std::mutex> l(m_mu);
@@ -142,7 +148,12 @@ public:
 	void start(std::function<void()> f)
 	{
 		wait();
-		if (!m_thread.joinable()) m_thread = std::thread([this] { loop(); });
+		if (!m_thread.joinable()) m_thread = std::thread([this] {
+#ifdef __APPLE__
+			pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+			loop();
+		});
 		{ std::lock_guard<std::mutex> l(m_mu); m_job = std::move(f); m_busy = true; }
 		m_cv.notify_all();
 	}

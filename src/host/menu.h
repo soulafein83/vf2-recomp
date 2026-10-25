@@ -35,9 +35,11 @@ public:
 	bool init(SDL_Window *win, SDL_Renderer *ren, const std::string &assets_dir);
 	bool ready() const;
 	void set_footer(const std::string &text);
+	void toast(const std::string &text, double seconds = 4);   // a notice over the game at the bottom right for a while ("": gone)
 	void set_fps(const std::string &text);      // the small FPS at the top right; empty hides it   // the small line at the bottom right (version and date)
 
 	bool is_open() const { return m_open; }
+	bool capturing() const { return bool(m_capture); }   // (a key or a seed being typed: every key its)
 	void open(menu_page root);            // opens at this page
 	void close();
 	void push(menu_page p);               // a sub-page
@@ -59,6 +61,9 @@ private:
 	std::unique_ptr<impl> m;
 	bool m_open = false;
 	std::string m_fps;
+	uint64_t m_toast_until = 0;   // (SDL_GetTicks)
+	double m_toast_wait = 0;      // (a notice's seconds, counted from the first picture drawn with the menu closed)
+	void show_overlay();          // (the overlay shown while there's an FPS or a notice and the menu's closed)
 	std::vector<menu_page> m_stack;
 	std::vector<int> m_sel_stack;
 	int m_sel = 0;
@@ -72,6 +77,7 @@ private:
 	void move(int d);
 	void select(int i);
 	void change(int d);
+	void click_change(int d);   // (a mouse click on a choice)
 	void activate();
 	void clear();
 	friend struct menu_listener;
