@@ -63,6 +63,7 @@ sideload it, as it is not on the Play Store.
 | `src/gpu/gpu3d_sdlgpu.cpp` (changed) | the own-device path (the tools, and the day the renderer isn't `gpu`) creates the device with `SDL_CreateGPUDeviceWithProperties` and the four Mali-hostile features off, as SDL's own renderer does |
 | `tools/release/make_icon.py` (changed) | a new `--android <variant>` mode, writing the launcher icons and the adaptive icon's two layers; the desktop output is unchanged (byte-identical) |
 | `Makefile` (changed) | the three ROM-free checks' targets |
+| `tools/release/licenses.sh` (changed) | the JetBrains Mono font's and the country flags' notices added to `LICENSES.txt` (both assets are new in v0.1.16/17) |
 | `android/` (new) | the whole Gradle + CMake project: `build.gradle`, `app/CMakeLists.txt` (mirrors the Makefile's sources; `-O2` for the Debug type, without which the game ran at ~8 fps), the manifest, SDL's Java side, the icons, and `android/README.md` |
 | `src/host/touch_controls.h` (new) | the on-screen pad: a d-pad, guard/punch/kick, Start and Menu, drawn in the renderer's logical coordinates and read per finger |
 | `tools/gpu3dbench.cpp`, `tools/touchcheck.cpp`, `tools/audiocheck.cpp` (new) | the three checks above |
