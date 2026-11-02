@@ -22,6 +22,12 @@
         android:name="android.hardware.vulkan.version"
         android:required="false" />
 
+    <!-- Online play: Play by address (the same network, or a VPN) uses UDP sockets, which this
+         permission allows. The lobby and its room codes would need libcurl, which Android doesn't
+         ship, so this build has no lobby address in it: room codes say so, and Play by address is
+         the way to play. Nothing listens; the permission is Android's normal one (no prompt). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <!-- No storage permission: the game keeps everything in its app-private folder
          (SDL_GetPrefPath -> Context.getFilesDir()), and reads vf2.zip through the SAF picker.
          No ROMs are bundled.

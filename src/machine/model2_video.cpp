@@ -361,7 +361,48 @@ void model2_video::model2_3d_zclip_w(u32 data)
 // TODO: only Sky Target seems to use this for unknown purpose
 u32 model2_video::polygon_count_r()
 {
+	m_polygon_count_reads++;
 	return m_raster->poly_list_index;
+}
+
+void model2_video::get_regs(int16_t &xoffset, int16_t &yoffset, u8 &zclip) const
+{
+	xoffset = m_crtc_xoffset;
+	yoffset = m_crtc_yoffset;
+	zclip = m_raster->master_z_clip;
+}
+
+void model2_video::set_regs(int16_t xoffset, int16_t yoffset, u8 zclip)
+{
+	m_crtc_xoffset = xoffset;
+	m_crtc_yoffset = yoffset;
+	m_renderer->set_xoffset(xoffset);
+	m_renderer->set_yoffset(yoffset);
+	m_raster->master_z_clip = zclip;
+}
+
+void model2_video::power_on()
+{
+	u16 *const texture_rom = m_raster->texture_rom;
+	const u32 texture_mask = m_raster->texture_rom_mask;
+	u32 *const polygon_rom = m_geo->polygon_rom;
+	const u32 polygon_mask = m_geo->polygon_rom_mask;
+	m_raster = std::make_unique<raster_state>();
+	m_raster->texture_rom = texture_rom;
+	m_raster->texture_rom_mask = texture_mask;
+	m_geo = std::make_unique<geo_state>();
+	m_geo->state = this;
+	m_geo->raster = m_raster.get();
+	m_geo->polygon_rom = polygon_rom;
+	m_geo->polygon_rom_mask = polygon_mask;
+	m_geo_read_start_address = 0;
+	set_regs(0, 0, 0);
+	m_render_done = false;
+	m_render_test_mode = false;
+	std::fill(std::begin(m_shown), std::end(m_shown), -1);
+	for (int p = 0; p < 4; p++) m_pictures[p].deferred = false;
+	m_deferred = false;
+	smooth_reset();
 }
 
 // What screen_update draws between the tile layers' two passes, worked out when MAME does it
@@ -640,7 +681,7 @@ void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 	object.texlod += raster->log_ram[raster->command_buffer[10] & 0x7fff];
 
 	/* determine whether we can cull this polygon */
-	cull = check_culling(raster,attr,min_z,max_z);
+	cull = check_culling(raster,attr,min_z,max_z) || raster->build_tint == 1;   // (the build's: not on yet)
 
 	/* set the object's z value */
 	switch ((attr >> 10) & 3)
@@ -706,6 +747,8 @@ void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 			poly->texheader[3] = object.texheader[3];
 			poly->luma = object.luma;
 			poly->texlod = object.texlod;
+			poly->build = raster->build_tint;
+			poly->hue = raster->hue;
 
 			/* set the viewport */
 			poly->viewport[0] = raster->viewport[0];
@@ -825,6 +868,24 @@ void model2_renderer::prepare(polygon *poly, const rectangle &cliprect, model2_v
 			out.v[i].pu = out.v[i].pu * out.v[i].pz * (1.0f / 8.0f);
 			out.v[i].pv = out.v[i].pv * out.v[i].pz * (1.0f / 8.0f);
 		}
+	}
+
+	// (a random fighter's hair: its palette colour in its own hue, hair_colour)
+	// (only the head's colours shared between the cast: luma table 0, its palette colour a colour (hair, bands, hoods); the
+	// fighter's own (its face's details, 1; its skin's ramp, 2 and on) as they are)
+	extra.pal = 0;
+	if (poly->hue >= 0 && (poly->texheader[1] & 0xff) == 0 && (renderer & 2)) {
+		const u32 hc = model2_video::hair_colour(u16(m_state.m_palram[extra.colorbase + 0x1000] & 0x7fff), poly->hue);
+		extra.pal = u16(hc);
+		if (hc >> 16) extra.luma = u16(std::min<u32>(u32(extra.luma) * (hc >> 16) / 16, 0xffff));
+	}
+	// (Cheats' random fighters' build: a polygon landing (white), or on but grey (its light's grey): drawn solid)
+	if (poly->build >= 2) {
+		const u32 v = poly->build == 2 ? 255u : 64u + (u32(poly->luma) * 9 >> 4);
+		out.renderer = 0;
+		extra.checker = 0;
+		extra.build_rgb = rgb_t(v, v, poly->build == 2 ? 255u : v + 6 > 255 ? 255u : v + 6);
+		for (int i = 0; i < poly->num_vertices; i++) out.v[i] = poly->v[i];   // (as a solid one's: not 1/z, u/z, v/z)
 	}
 
 	// the rows it can reach, for skipping the bands it can't (none if a position isn't a number)
@@ -961,9 +1022,10 @@ void model2_video::export_list(const std::vector<drawn_poly> &list, std::vector<
 		g.checker = d.extra.checker;
 		g.vp[0] = int16_t(d.vp.min_x); g.vp[1] = int16_t(d.vp.max_x); g.vp[2] = int16_t(d.vp.min_y); g.vp[3] = int16_t(d.vp.max_y);
 		const m2_poly_extra_data &e = d.extra;
+		if (e.build_rgb) { g.renderer = 0; g.colour = e.build_rgb | 0xff000000u; continue; }   // (the random fighters' build)
 		if (!(d.renderer & 2)) {
 			// draw_scanline_solid's colour
-			const u32 c = m_palram[e.colorbase + 0x1000] & 0xffff, l = e.luma >> 2;
+			const u32 c = e.pal ? e.pal & 0x7fff : m_palram[e.colorbase + 0x1000] & 0xffff, l = e.luma >> 2;
 			const u32 r = m_colorxlat[0x0000 / 2 + (((c >> 0) & 0x1f) << 8) + l] & 0xff;
 			const u32 gg = m_colorxlat[0x4000 / 2 + (((c >> 5) & 0x1f) << 8) + l] & 0xff;
 			const u32 b = m_colorxlat[0x8000 / 2 + (((c >> 10) & 0x1f) << 8) + l] & 0xff;
@@ -971,7 +1033,7 @@ void model2_video::export_list(const std::vector<drawn_poly> &list, std::vector<
 			continue;
 		}
 		for (int i = 0; i < d.num_vertices; i++) { g.z[i] = d.v[i].pz; g.u[i] = d.v[i].pu; g.v[i] = d.v[i].pv; }
-		g.pal = u16(m_palram[e.colorbase + 0x1000] & 0x7fff);
+		g.pal = e.pal ? u16(e.pal & 0x7fff) : u16(m_palram[e.colorbase + 0x1000] & 0x7fff);
 		g.lumabase = u16(e.lumabase);
 		g.luma = e.luma;
 		g.texlod = e.texlod;
@@ -1550,6 +1612,7 @@ void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 	/* loop through the following links */
 	for (i = 0; i < count; i++)
 	{
+		if (m_build_obj.side >= 0) raster->build_tint = build_tint(i);   // (the random fighters' build)
 		/* read in the attributes */
 		attr = *input++;
 
@@ -1697,6 +1760,7 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 	/* loop through the following links */
 	for (i = 0; i < count; i++)
 	{
+		if (m_build_obj.side >= 0) raster->build_tint = build_tint(i);   // (the random fighters' build)
 		/* read in the attributes */
 		attr = *input++;
 
@@ -1859,6 +1923,7 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 	/* loop through the following links */
 	for (i = 0; i < count; i++)
 	{
+		if (m_build_obj.side >= 0) raster->build_tint = build_tint(i);   // (the random fighters' build)
 		/* read in the attributes */
 		attr = *input++;
 
@@ -2049,6 +2114,7 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 	/* loop through the following links */
 	for (i = 0; i < count; i++)
 	{
+		if (m_build_obj.side >= 0) raster->build_tint = build_tint(i);   // (the random fighters' build)
 		/* read in the attributes */
 		attr = *input++;
 
@@ -2228,6 +2294,9 @@ u32 *model2_video::geo_object_data(geo_state *geo, u32 opcode, u32 *input)
 
 	u32 *obp;                /* Object Pointer */
 
+	// (a random player's select portrait, its cursor on its way: random_fighters::select_cover)
+	if ((m_hide_portrait[0] && geo->matrix[9] < 0) || (m_hide_portrait[1] && geo->matrix[9] > 0)) return input;
+
 	/* push the initial set of data to the 3d rasterizer */
 	model2_3d_push(raster, opcode >> 23);
 	model2_3d_push(raster, tpa);
@@ -2254,6 +2323,11 @@ u32 *model2_video::geo_object_data(geo_state *geo, u32 opcode, u32 *input)
 	// Virtual On & Gunblade NY
 	if (obc == 0)
 		obc = 0xfffff;
+
+	// (Cheats' random fighters' round-1 build: this object's, if it's a fighter's being built)
+	m_build_obj.side = -1;
+	raster->hue = -1;
+	if (!m_build_parts.empty()) build_object(oba, geo->matrix, raster);
 
 	// smooth motion: the object kept with its matrix, or drawn again with the blended one
 	float kept[12];
@@ -2283,6 +2357,10 @@ u32 *model2_video::geo_object_data(geo_state *geo, u32 opcode, u32 *input)
 		case 3: geo_parse_nn_s(geo, obp, obc); break;
 	}
 	if (swapped) memcpy(geo->matrix, kept, sizeof kept);
+	m_build_obj.side = -1;
+	raster->build_tint = 0;
+	raster->hue = -1;
+	raster->hue = -1;
 
 	/* move by 4 parameters */
 	return input;
@@ -2862,6 +2940,7 @@ u32 *model2_video::geo_process_command(geo_state *geo, u32 opcode, u32 *input, b
 void model2_video::geo_parse()
 {
 	if (m_smooth) smooth_record_start();
+	m_build_frame = m_geo_frame;
 	geo_run(m_bufferram, m_geo_read_start_address, m_geo.get(), m_raster.get());
 	m_render_done = false;
 	m_parsed_frame = m_geo_frame;
@@ -2879,6 +2958,9 @@ void model2_video::geo_run(u32 *buffer, u32 start, geo_state *geo, raster_state 
 
 	// reset raster frame variables
 	render_frame_start(raster);
+	m_build_run = -1;
+	m_build_obj.side = -1;
+	raster->build_tint = 0;
 
 	while (end_code == false && (input - buffer) < 0x20000/4 && op_count++ < 0x8000)
 	{
@@ -2906,6 +2988,96 @@ void model2_video::geo_run(u32 *buffer, u32 start, geo_state *geo, raster_state 
 /***********************************************************************************************/
 
 /***********************************************************************************************/
+
+// Cheats' random fighters' round-1 build (m_build_parts): the object about to be parsed, by its polygons' address. A
+// model only one side's fighter has is that side's (and the game's run of that fighter's models goes on); one both
+// have, the run's side's, unless it's more than twice as far from that side's last model as from the other's (the
+// first of the next fighter's run). A side's model, being built: its group, polygons and frames into the build
+static inline float dist2(const float *a, const float *b) { float s = 0; for (int i = 0; i < 3; i++) s += (a[i] - b[i]) * (a[i] - b[i]); return s; }
+
+void model2_video::build_object(u32 oba, const float *matrix, raster_state *raster)
+{
+	const auto it = m_build_parts.find(oba);
+	const float *t = &matrix[9];
+	if (it == m_build_parts.end()) {
+		// (in a fighter's run, where its last model is: what the game makes as it goes in polygon RAM (a belt and its
+		// ends), a head's extras (Kage's hood), with the model it's drawn after)
+		const int run = m_build_run;
+		if (run >= 0 && dist2(t, m_build_at[run]) < 0.25f) {
+			if (m_build_group[run] == 8 && m_hair_hue[run] >= 0) raster->hue = m_hair_hue[run];   // (a head's extras: its hair's)
+			const int64_t e = int64_t(m_build_frame) - m_build_start[run];
+			if (m_build_start[run] >= 0 && e <= BUILD_FRAMES) m_build_obj = { run, m_build_group[run], 1, e };
+			return;
+		}
+		m_build_run = -1;
+		return;
+	}
+	const build_part &bp = it->second;
+	int side;
+	if (m_portraits && bp.sides == 3) side = t[0] > 0 ? 1 : 0;   // (the select's portraits: player 1's the left)
+	else if (bp.sides == 1 || bp.sides == 2) {
+		side = bp.sides == 1 ? 0 : 1;
+		m_build_run = side;
+		memcpy(m_build_at[side], t, sizeof m_build_at[side]);
+		m_build_seen[side] = m_build_frame;
+	} else {
+		// (each side's last place: this frame's, or one a few frames before (a run that starts with a shared model))
+		side = m_build_run;
+		auto known = [&](int k) { return m_build_seen[k] + 8 >= m_build_frame && m_build_seen[k] <= m_build_frame + 8; };
+		if (known(0) && known(1)) {
+			if (side < 0) side = dist2(t, m_build_at[0]) <= dist2(t, m_build_at[1]) ? 0 : 1;
+			else if (dist2(t, m_build_at[side]) > 4 * dist2(t, m_build_at[side ^ 1])) side ^= 1;
+		}
+		if (side < 0) side = known(1) && !known(0) ? 1 : 0;
+	}
+	if (!(bp.sides >> side & 1)) return;
+	m_build_group[side] = bp.group[side];
+	if (bp.group[side] == 8 && m_hair_hue[side] >= 0) raster->hue = m_hair_hue[side];
+	if (m_build_start[side] < 0) return;
+	const int64_t e = int64_t(m_build_frame) - m_build_start[side];
+	if (e > BUILD_FRAMES) return;   // (before its start: none on yet)
+	m_build_obj = { side, bp.group[side], std::max<int>(bp.polys, 1), e };
+}
+
+// A random fighter's hair (VF1 Recomp's): a palette colour (5 bits each: r, g, b) of its head's colours the cast share (luma
+// table 0: hair, bands, hoods; its face's details and skin are its own colours, not these) in its hair's hue, unless it's
+// skin (Wolf's orange hair kept, as VF1's); greys and black (Akira's hair and band) given the hue, a dark one lightened
+u32 model2_video::hair_colour(u16 pal, int hue)
+{
+	const float fr = (pal & 31) / 31.f, fg = (pal >> 5 & 31) / 31.f, fb = (pal >> 10 & 31) / 31.f;
+	const float mx = std::max({ fr, fg, fb }), mn = std::min({ fr, fg, fb }), dl = mx - mn;
+	float hh = 0, ss = mx > 0 ? dl / mx : 0, vv = mx;
+	if (dl > 0) { hh = mx == fr ? (fg - fb) / dl : mx == fg ? 2 + (fb - fr) / dl : 4 + (fr - fg) / dl; hh /= 6; if (hh < 0) hh += 1; }
+	const bool skin = hh > 0.015f && hh < 0.13f && ss > 0.15f && ss < 0.75f && vv > 0.45f;
+	if (skin) return 0;
+	const bool no_lift = hue >= 1000;   // (Kage's head: his mask black, not lifted)
+	hh = float(hue % 1000) / 1000.f;
+	ss = std::max(ss, 0.6f);
+	// (dark: the colour its brightest, and the texels' light raised (luma over 255), so its hue shows as a dark colour)
+	const u32 lift = vv < 0.5f && !no_lift ? u32(std::lround(16 * std::clamp(0.55f / std::max(vv, 0.12f), 1.f, 2.f))) : 0;
+	if (lift) vv = 0.9f;
+	const float c = vv * ss, x = c * (1 - std::fabs(std::fmod(hh * 6, 2.f) - 1)), m = vv - c;
+	float rr = 0, gg = 0, bb = 0;
+	const int sx = int(hh * 6) % 6;
+	if (sx == 0) rr = c, gg = x; else if (sx == 1) rr = x, gg = c; else if (sx == 2) gg = c, bb = x; else if (sx == 3) gg = x, bb = c; else if (sx == 4) rr = x, bb = c; else rr = c, bb = x;
+	auto q = [](float v) { return u16(std::clamp(int(std::lround(v * 31)), 0, 31)); };
+	return u32(0x8000 | q(rr + m) | q(gg + m) << 5 | q(bb + m) << 10) | lift << 16;
+}
+
+// A polygon of the object being built (its place along the model's strip, i): 1 not on yet, 2 landing (white), 3 on
+// but grey, 0 as ever
+u8 model2_video::build_tint(u32 i) const
+{
+	const build_obj &b = m_build_obj;
+	auto front = [&](int64_t e, int start, int span) { return e < start ? 0 : int(std::min<int64_t>((e - start) * b.polys / span + 1, b.polys)); };
+	const int appear = b.group * BUILD_STEP, colour = BUILD_COLOUR + b.group * BUILD_COLOUR_STEP;
+	const int n = std::min(int(i), b.polys - 1);   // (one past the count given: with the last)
+	if (n >= front(b.e, appear, BUILD_SPAN)) return 1;
+	if (n >= front(b.e - BUILD_FLASH, appear, BUILD_SPAN)) return 2;
+	if (n >= front(b.e, colour, BUILD_COLOUR_SPAN)) return 3;
+	if (n >= front(b.e - BUILD_FLASH, colour, BUILD_COLOUR_SPAN)) return 2;
+	return 0;
+}
 
 // model2rd.ipp: the scanline renderers
 
@@ -2950,7 +3122,7 @@ void model2_renderer::draw_scanline_solid(int32_t scanline, const extent_t& exte
 
 	luma = object.luma >> 2;
 
-	color = state->m_palram[(color + 0x1000)] & 0xffff;
+	color = object.pal ? object.pal & 0x7fff : state->m_palram[(color + 0x1000)] & 0xffff;
 
 	colortable_r += ((color >>  0) & 0x1f) << 8;
 	colortable_g += ((color >>  5) & 0x1f) << 8;
@@ -2968,6 +3140,7 @@ void model2_renderer::draw_scanline_solid(int32_t scanline, const extent_t& exte
 
 	// build the final color
 	color = rgb_t(tr, tg, tb);
+	if (object.build_rgb) color = object.build_rgb;   // (the random fighters' build: its own)
 
 	int x = extent.startx;
 	int dx = checker ? 2 : 1;
@@ -3166,7 +3339,7 @@ void model2_renderer::draw_scanline_tex(int32_t scanline, const extent_t &extent
 	// calculate maximum mipmap level from texture dimensions; we go down to 2x2
 	s32 max_level = 30 - std::countl_zero(std::min(object.texwidth, object.texheight));
 
-	colorbase = state->m_palram[(colorbase + 0x1000)] & 0x7fff;
+	colorbase = object.pal ? object.pal & 0x7fff : state->m_palram[(colorbase + 0x1000)] & 0x7fff;
 
 	colortable_r += ((colorbase >>  0) & 0x1f) << 8;
 	colortable_g += ((colorbase >>  5) & 0x1f) << 8;
@@ -3233,10 +3406,11 @@ void model2_renderer::draw_scanline_tex(int32_t scanline, const extent_t &extent
 		}
 
 		// filtered texel has 8 bits of precision but translator map has 128 (7-bit) entries; need to shift right by 1
-		u8 luma = u32(lumaram[lumabase + (t >> 1)]) * object.luma / 256;
+		// (object.luma above 255: a random fighter's dark hair lifted, hair_colour; the same values below it)
+		u32 luma = u32(lumaram[lumabase + (t >> 1)]) * object.luma / 256;
 
 		// Virtua Striker sets up a luma of 0x40 for national flags on bleachers, fix here.
-		luma = std::min(luma, u8(0x3f));
+		luma = std::min(luma, u32(0x3f));
 
 		// we have the 6 bits of luma information along with 5 bits per color component
 		// now build and index into the master color lookup table and extract the raw RGB values

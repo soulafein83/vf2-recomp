@@ -24,12 +24,17 @@
 #include "model2_video.h"
 #include "parallel.h"
 #include "scsp.h"
+#include "state_io.h"
 #include "../../third_party/mame/m68000/m68000.h"
+#include "hud_names.h"
 #include <array>
 #include <functional>
 #include <deque>
 #include <map>
 #include <vector>
+#include <mutex>
+
+class random_fighters;
 
 class model2a : public mame_bus32
 {
@@ -44,6 +49,31 @@ public:
 	~model2a() override;
 
 	void reset();
+	// A cold start: every RAM as a board just switched on has it (zeros, backup RAM 0xff, the EEPROM's cells
+	// 0xffff), the CPUs' registers and the board's cleared, nothing kept from a run before (reset() keeps work
+	// RAM, the tile and texture RAMs, backup RAM and more, and the CPUs' resets leave some registers). Then
+	// reset(). Netplay's start: two boards that ran differently before start the same.
+	void power_on();
+
+	// Save states (state_io.h): everything the game's run depends on, the i960's and the TGP's state, the
+	// scheduler (its timers, the CPUs' clocks, the input lines' queues), the FIFOs, the board's registers and
+	// all its RAMs (about 7 MB). Not the sound board: a state is whole only with it held (set_sound(false)) and
+	// the byte link (set_byte_link(true)), as in a match, where nothing the sound board does reaches this
+	// board. Nor the 3D's own state (its matrices, lists, pictures): the picture's alone, and it goes by the
+	// widescreen setting (the game never reads it back; polygon_count_reads() says if it did). save_state
+	// reuses the buffer's memory; sections, if given, are filled with where each part starts. load_state
+	// restores one this build saved, and false (the board then half restored: reset it) if it isn't one.
+	// Between frames only (after run_frame()).
+	void save_state(std::vector<uint8_t> &out, std::vector<m2::StateSection> *sections = nullptr);
+	bool load_state(const uint8_t *p, size_t n);
+	static constexpr uint32_t STATE_MAGIC = 0x53324656, STATE_VERSION = 1;   // "VF2S"
+	// The state's first bytes are for this board's saves alone (which board, since which reset, which save): two
+	// boards in the same state have the same bytes after them, and only those are compared or hashed
+	static constexpr size_t STATE_HEADER = 24;
+	uint64_t polygon_count_reads() const { return m_video->m_polygon_count_reads; }
+	// A hash of the ROMs' contents as loaded, before any patch (the handshake's: both players need the same)
+	uint64_t rom_hash() const { return m_rom_hash; }
+
 	// Runs to the end of the next vblank, where MAME draws the screen. MAME's screen starts at
 	// the top of vblank: vblank N begins at cycle (N + 1) * CYCLES_PER_FRAME, and frame N (as
 	// MAME's frame_number counts) is drawn when it ends, VBLANK_CYCLES later.
@@ -228,6 +258,21 @@ public:
 	u32 peek32(u32 a) { return read_dword(a); }
 	const std::vector<u8> &workram() const { return m_workram; }
 	const segas24_tile &tiles() const { return m_tiles; }
+	// Online play's names under the energy bars (hud_names.h), in the 2D picture only, and their flags: "" none
+	void set_hud_names(const std::string names[2], const m2hud::Flag *flags[2] = nullptr)
+	{
+		std::lock_guard<std::mutex> lk(m_hud_mx);
+		for (int p = 0; p < 2; p++) { m_hud_names[p] = names[p]; m_hud_flags[p] = flags && flags[p] ? *flags[p] : m2hud::Flag{}; }
+	}
+	// where each player's flag goes (hud_names: its place left for the host's sharper one), in the picture's pixels
+	// (width() by HEIGHT): its left, and the box's top; false for none in the picture last made
+	bool hud_flag_at(int p, int &x, int &y)
+	{
+		std::lock_guard<std::mutex> lk(m_hud_mx);
+		x = m_hud_flag_at[p][0];
+		y = m_hud_flag_at[p][1];
+		return x >= 0 && !m_hud_names[p].empty();
+	}
 	const std::vector<u8> &backup_ram() const { return m_backup; }
 	const u16 *eeprom_cells() const { return m_eeprom.cells; }
 	// The board's NVRAM, to keep between runs: backup RAM (16 KB) and the 93C46's 64 cells.
@@ -282,12 +327,53 @@ public:
 	// the frames after it are no longer MAME's. False if the program isn't the one known. Before
 	// the boot reaches it (frame 85).
 	bool shorten_warning();
+	void restore_warning();   // (shorten_warning undone)
 	// Secret characters: the player select's Akira (either player's) is the fighter with this
 	// number instead: 9 Dural, 11 MUE and 12 KOJAC (Lion's body in Akira's moves, from the debug
 	// menu), 0 Akira himself. The select shows the fighter's portrait with Akira's name and
 	// profile. Takes effect as a cursor next moves onto him: set before the game starts (the
 	// menu restarts it). False for another number, or if the program isn't the one known.
 	bool set_secret_character(int fighter);
+	// Cheats' random fighters (random_fighter.cpp). Each player's fighter: "" the select as ever, "*" a random
+	// fighter, a new one each game, or a name's (as on its energy bar: a seed's, the same fighter on any machine).
+	// Anything but "" is picked for that player at the select: three of the cast made one, its head, body and limbs
+	// from the three, its commands dealt from them a move group at a time, its stance the first's, its voice one of
+	// theirs, its name theirs blended. A name is a recipe, the same fighter in every game that has it (VF1's book's
+	// names VF1's, then VF2's own with Lion or Shun: the book). False (nothing changed) for a name not in the book.
+	// Random opponents: every computer opponent a random fighter (any of the book's), made afresh for each match.
+	// Applied by apply_random_fighters (the menu restarts the game).
+	static constexpr uint32_t RANDOM_SEEDS = 32768;   // (the numeric seeds VF2's own names are made from)
+	bool set_random_player(int pl, const std::string &setting);
+	void set_random_opponents(bool on);
+	// The settings into the game's tables: the ROMs as loaded when none is on. The program changed (made again) when
+	// the first goes on or the last off. False if the program isn't the one known (then all off). Before a reset.
+	bool apply_random_fighters();
+	void random_fighters_off();   // (online play: all off, the ROMs as loaded, until the next apply)
+	// Online play (vf2_netplay): every random choice from the match's seed, the same on both sides (Random's draws and
+	// the colours, never the clock), until random_fighters_off; a player's named fighter by its place in the book
+	// (from 1: random_fighter_names' value); and everything the feature knew forgotten (off first: the next use starts
+	// from the ROMs as they are then, the match's patches on, alike on both sides)
+	void set_random_seed(uint32_t seed);
+	bool set_random_player_place(int pl, uint32_t place);
+	void random_fighters_forget();
+	void random_fighters_decode();   // (every texture a random fighter may take decoded now, not as a match goes: a second or so)
+	const std::map<std::string, uint32_t> &random_fighter_names();   // (the book: every name, its place in it from 1; made once)
+	bool random_fighters_on() const;
+	// The ranking's names for random fighters (ranking_frame), as text for the host to keep beside the backup: a line
+	// an entry, its time, initials and fighter (hex) and its name; and its version (it changes as one is learnt)
+	std::string ranking_names() const;
+	void set_ranking_names(const std::string &text);
+	uint32_t ranking_names_version() const { return m_rank_version; }
+	// The player select hidden: everyone at it with a random fighter (one player alone, or both; online too), picked
+	// for them at once: who they got is a surprise as the fight comes in. A player picking as ever there, it shows
+	bool random_select_hidden() const;
+	std::string random_fighter_name(int pl);   // (a player's fighter's now, "" none: the energy bar's)
+	// What a name's fighter is made of, by whose: "head|body|arms|legs|moves (move groups)|voice" ("" none)
+	std::string random_fighter_makeup(const std::string &name);
+	// The book in its order: each name's recipe as the recipe spec's table has it ("name leader second third head
+	// voice", "-" none: what the next game carries), or (owners) "name leader second third head voice" (the head as
+	// in this game) then its 8 move groups' owners and "|" its 7 part groups' (0 the first)
+	std::vector<std::string> random_fighter_book(bool owners);
 
 	// Milestones (TGP upload, IRQs, first scheduler dispatch...) as they happen, to stderr.
 	std::function<void(const std::string &)> on_milestone;
@@ -320,6 +406,13 @@ public:
 	// reference runs for the CPU/video regression (the default). Takes effect at reset().
 	void set_sound(bool on) { m_sound_on = on; }
 	bool sound() const { return m_sound_on; }
+	// A board for its sound alone (online play's: the match's board runs with its sound held, the same on both
+	// sides, and this one plays what it sends): only the 68000 and the SCSP run (the i960, the TGP and the Z80
+	// never do), and the bytes for the sound board come from sound_bytes, a MIDI byte's time apart (320 us), as
+	// the UART would send them. From the next reset() (with set_sound(true)).
+	void set_sound_only(bool on) { m_sound_only = on; }
+	void sound_bytes(const uint8_t *b, size_t n) { m_snd_queue.insert(m_snd_queue.end(), b, b + n); }
+	size_t sound_bytes_waiting() const { return m_snd_queue.size(); }
 	// The link to the sound board a byte at a time (for the host): each byte the UART sends reaches
 	// the sound board's MIDI input when its stop bit would be read there, and the UART's status
 	// changes when the bit-level transmitter would change it, without running the UART's 500 kHz
@@ -360,6 +453,25 @@ private:
 	struct tgp_bus;
 	friend struct tgp_bus;
 
+	// Save states (save_state): the field list, run both ways; the device memories copied by the 4 KB pages
+	// written since (each page's save number when last written). The RAMs the recompiled code writes directly,
+	// and buffer RAM (the TGP's too), are copied whole.
+	template <class IO> void state(IO &io);
+	// (Cheats' random fighters in a save state, while they're on: the ROM's bytes they change as a match goes, and what
+	// they know of them; a load puts back the fighters the state had, made again if they're others now)
+	void random_state(m2::StateWriter &io);
+	void random_state(m2::StateReader &io);
+	enum { P_TILE, P_CHAR, P_PAL, P_XLAT, P_FB_A, P_FB_B, P_TEX0, P_TEX1, P_LUMA, PAGED };
+	static constexpr size_t PAGE = 4096;
+	std::vector<uint32_t> m_page_gen[PAGED];
+	uint32_t m_snap_id = 0, m_snap_epoch = 0, m_snap_gen = 1;
+	uint64_t m_rom_hash = 0;
+	void touch(int r, size_t byte) { m_page_gen[r][byte / PAGE] = m_snap_gen; }
+	u8 *paged_base(int r);   // (where each is now: swap_2d swaps the vectors)
+	size_t paged_bytes(int r) const;
+	size_t fixed_state_size() const;
+	void setup_pages();
+
 	romset::result m_roms;
 	const std::vector<u8> &m_rom, &m_data;
 	i960_device m_cpu;
@@ -374,6 +486,10 @@ private:
 	std::vector<u32> m_tex0, m_tex1;
 	std::vector<u8> m_lumaram, m_m2comm_share;
 	segas24_tile m_tiles;
+	std::mutex m_hud_mx;   // (the names are set by the host while a picture's drawn alongside)
+	std::string m_hud_names[2];
+	m2hud::Flag m_hud_flags[2];
+	int m_hud_flag_at[2][2] = { { -1, -1 }, { -1, -1 } };
 
 	// ---- MAME's scheduler (emu/schedule.cpp, diexec.cpp) for the i960 and the TGP ----
 	using atime = unsigned __int128;   // attoseconds since power-on
@@ -464,6 +580,9 @@ private:
 	u32 m_geo_write_start = 0;
 	std::unique_ptr<model2_video> m_video;
 	bool m_sound_on = false;
+	bool m_sound_only = false;
+	std::deque<uint8_t> m_snd_queue;   // (sound_only: the bytes to go to the sound board)
+	atime m_snd_next = 0;              // (and when the next may)
 	float m_volume[2] = { 1, 1 };
 	float m_level = 1, m_limit = 1;   // set_level's gain; the limiter's gain now
 	bool m_backdrop_smooth = false;
@@ -639,6 +758,22 @@ private:
 
 	// M2COMM link board (no link)
 	u8 m_m2comm_cn = 0, m_m2comm_fg = 0;
+
+	// Cheats' random fighters (random_fighter.cpp): made when first set, run after each frame while any is on
+	friend class random_fighters;
+	struct random_deleter { void operator()(random_fighters *) const; };
+	std::unique_ptr<random_fighters, random_deleter> m_random;
+	random_fighters &randoms();
+	void random_frame();
+	// The ranking's random fighters' names (the CHARACTER column's MUE or KOJAC, fighters 11 and 12: the random fighter
+	// who set the time, as VF1 Recomp's): each entry's (its time, initials and fighter, as the game keeps them) name,
+	// learnt as it comes in, kept by the host beside the backup (ranking_names), drawn over the column (drawing only)
+	std::map<std::string, std::string> m_rank_names;
+	uint32_t m_rank_version = 0;
+	bool m_tiles_subst_on = false;
+	void ranking_frame();
+	void random_select_inputs();   // (before a frame: the select's presses for a random player, select_inputs)
+	std::string m_random_hud[2];   // (the names under the energy bars offline: hud_names, under m_hud_mx)
 
 	// handlers by dword, for everything that isn't plain memory
 	u32 dev_read(u32 a, u32 mem_mask);

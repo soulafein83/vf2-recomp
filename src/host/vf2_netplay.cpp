@@ -1,0 +1,344 @@
+#include "vf2_netplay.h"
+#include <cctype>
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+
+namespace vf2net {
+
+namespace {
+
+// IN0's bits for each player (active low on the board)
+constexpr uint8_t IN0_COIN[2] = { 0x01, 0x02 }, IN0_START[2] = { 0x10, 0x20 };
+
+constexpr uint32_t BLOB_MAGIC = 0x42324656;          // "VF2B" (v0.1.16's: no random fighters)
+constexpr uint32_t BLOB_MAGIC_RANDOM = 0x43324656;   // "VF2C" (a random fighters' match: the seed, the host's fighter)
+
+} // namespace
+
+uint16_t pack(uint8_t in0, uint8_t port, int p)
+{
+	return uint16_t(uint8_t(~port) | (in0 & IN0_START[p] ? 0 : START_BUTTON) | (in0 & IN0_COIN[p] ? 0 : COIN_BUTTON));
+}
+
+void unpack(const uint16_t input[2], model2a &b)
+{
+	uint8_t in0 = 0xff;   // (test and service never pressed)
+	for (int p = 0; p < 2; p++) {
+		if (input[p] & START_BUTTON) in0 &= uint8_t(~IN0_START[p]);
+		if (input[p] & COIN_BUTTON) in0 &= uint8_t(~IN0_COIN[p]);
+	}
+	b.m_in0 = in0;
+	b.m_in1 = uint8_t(~input[0]);
+	b.m_in2 = uint8_t(~input[1]);
+	b.m_sw = 0xff;
+}
+
+std::string online_version(const std::string &b)
+{
+	// a release's name: v, three numbers, and maybe a word after them (-alpha, -online-preview), not git describe's
+	// -<commits>-g<commit> (a build between releases)
+	size_t i = 0;
+	auto number = [&] { const size_t at = i; while (i < b.size() && isdigit((unsigned char)b[i])) i++; return i > at; };
+	bool release = !b.empty() && b[i++] == 'v' && number() && i < b.size() && b[i++] == '.' && number() && i < b.size() && b[i++] == '.' && number();
+	if (release && i < b.size()) {
+		release = b[i] == '-' && i + 1 < b.size() && islower((unsigned char)b[i + 1]);
+		for (size_t k = i + 1; release && k < b.size(); k++)
+			release = islower((unsigned char)b[k]) || isdigit((unsigned char)b[k]) || b[k] == '-';
+		// (a name's last parts "-<n>-g<hex>": git describe's between releases)
+		const size_t g = b.rfind("-g");
+		if (release && g != std::string::npos && g > i && g + 2 < b.size()) {
+			size_t d = b.rfind('-', g - 1);
+			const std::string n = b.substr(d + 1, g - d - 1), h = b.substr(g + 2);
+			const bool num = !n.empty() && n.find_first_not_of("0123456789") == std::string::npos;
+			const bool hex = h.find_first_not_of("0123456789abcdef") == std::string::npos;
+			if (num && hex) release = false;
+		}
+	}
+	return release ? NET_VERSION : b;
+}
+
+uint64_t content_hash(const model2a &b) { return b.rom_hash(); }
+
+bool random_version(const std::string &v)
+{
+	const size_t n = strlen(RANDOM_TAG);
+	return v.size() > n && v.compare(v.size() - n, n, RANDOM_TAG) == 0;
+}
+
+// [magic "VF2B"][backup RAM][EEPROM][secret][stage]
+std::vector<uint8_t> start_blob(const model2a &b, int secret)
+{
+	std::vector<uint8_t> out(4);
+	memcpy(out.data(), &BLOB_MAGIC, 4);
+	const std::vector<uint8_t> &backup = b.backup_ram();
+	out.insert(out.end(), backup.begin(), backup.end());
+	const uint8_t *e = reinterpret_cast<const uint8_t *>(b.eeprom_cells());
+	out.insert(out.end(), e, e + 64 * 2);
+	out.push_back(uint8_t(secret));
+	// the host's random place in the stages' list (stage_for): a fresh one each match
+	const uint64_t t = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()) * 2654435761u;
+	out.push_back(uint8_t((t >> 24) % STAGES));
+	return out;
+}
+
+// [magic "VF2C"][backup RAM][EEPROM][secret][stage][seed: 4][the host's fighter's length][its letters]
+std::vector<uint8_t> start_blob_random(const model2a &b, int secret, const std::string &host_fighter, uint32_t seed)
+{
+	std::vector<uint8_t> out = start_blob(b, secret);
+	memcpy(out.data(), &BLOB_MAGIC_RANDOM, 4);
+	for (int k = 0; k < 4; k++) out.push_back(uint8_t(seed >> (8 * k)));
+	const std::string f = host_fighter.substr(0, vfnet::MAX_EXTRA);
+	out.push_back(uint8_t(f.size()));
+	out.insert(out.end(), f.begin(), f.end());
+	return out;
+}
+
+std::string fighter_extra(const std::string &setting, model2a &b)
+{
+	if (setting.empty()) return "";
+	if (setting == "*") return "R";
+	std::string n;
+	for (char ch : setting) if (ch != ' ') n += char(toupper(uint8_t(ch)));
+	const auto &names = b.random_fighter_names();
+	const auto it = names.find(n);
+	return it == names.end() ? "R" : "S" + std::to_string(it->second);   // (a name the book hasn't: Random, as offline)
+}
+
+bool fighter_setting(const std::string &x, model2a &b, std::string &setting)
+{
+	setting.clear();
+	if (x.empty()) return true;
+	if (x == "R") { setting = "*"; return true; }
+	const bool digits = x.size() >= 2 && x.size() <= 6 && x[0] == 'S' && x.find_first_not_of("0123456789", 1) == std::string::npos;
+	if (!digits) return false;
+	const long v = strtol(x.c_str() + 1, nullptr, 10);
+	if (v < 1 || size_t(v) > b.random_fighter_names().size()) return false;
+	setting = x;   // (a named fighter by its place: set_players)
+	return true;
+}
+
+std::string fighter_words(const std::string &x, model2a &b)
+{
+	if (x == "R") return "RANDOM";
+	if (x.size() > 1 && x[0] == 'S') {
+		const uint32_t place = uint32_t(strtoul(x.c_str() + 1, nullptr, 10));
+		for (const auto &[name, at] : b.random_fighter_names())
+			if (at == place) return name;
+		return "SEED " + x.substr(1);
+	}
+	return "";
+}
+
+void set_players(model2a &b, const std::string fighters[2])
+{
+	for (int p = 0; p < 2; p++)
+		if (fighters[p].size() > 1 && fighters[p][0] == 'S') b.set_random_player_place(p, uint32_t(strtoul(fighters[p].c_str() + 1, nullptr, 10)));
+		else b.set_random_player(p, fighters[p]);
+}
+
+std::vector<uint8_t> Adapter::host_blob(int secret)
+{
+	if (!random_fighters) return start_blob(board, secret);
+	uint32_t seed = uint32_t(uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()) * 2654435761u) ^ 0x9e3779b9u;
+	if (!seed) seed = 1;
+	return start_blob_random(board, secret, own_extra, seed);
+}
+
+// (a frame's bytes go at once, a guessed frame's as much as a certain one's, so no sound waits for the other
+// side's input)
+void Adapter::take_sound(std::vector<uint8_t> &out)
+{
+	sound_taken = true;
+	out.clear();
+	auto it = sound_sent.find(frame);
+	const bool sent = it != sound_sent.end() && !it->second.empty();
+	if (!pending.empty() && !sent) {
+		out = pending;
+		sound_sent[frame] = pending;
+	} else if (it == sound_sent.end())
+		sound_sent[frame] = {};
+	pending.clear();
+	while (!sound_sent.empty() && sound_sent.begin()->first + 64 < frame) sound_sent.erase(sound_sent.begin());
+}
+
+bool Adapter::begin(const std::vector<uint8_t> &blob)
+{
+	const size_t backup_n = board.backup_ram().size();
+	// v0.1.16's blob ("VF2B": backup RAM, EEPROM, secret, stage), and a random fighters' match's after it ("VF2C": the
+	// seed, the host's fighter)
+	const size_t BASE = 4 + backup_n + 64 * 2 + 2, FIXED = BASE + 4 + 1;
+	uint32_t magic = 0, seed = 0;
+	if (random_fighters ? blob.size() < FIXED || blob.size() != FIXED + blob[FIXED - 1] : blob.size() != BASE) return false;
+	memcpy(&magic, blob.data(), 4);
+	if (magic != (random_fighters ? BLOB_MAGIC_RANDOM : BLOB_MAGIC)) return false;
+	const int secret = blob[BASE - 2];
+	stage_offset = blob[BASE - 1] % STAGES;
+	if (secret != 0 && secret != 9 && secret != 11 && secret != 12) return false;
+	// each player's fighter (Cheats' random fighters): the host's (player 1's) in its blob, the guest's in its hello
+	fighters[0].clear();
+	fighters[1].clear();
+	if (random_fighters) {
+		memcpy(&seed, blob.data() + BASE, 4);
+		const std::string host_x(reinterpret_cast<const char *>(blob.data()) + FIXED, blob[FIXED - 1]);
+		if (!fighter_setting(host_x, board, fighters[0]) || !fighter_setting(hosting ? their_extra : own_extra, board, fighters[1])) return false;
+	}
+	const bool random = !fighters[0].empty() || !fighters[1].empty();
+	if (settle) settle();
+	if (on_begin) on_begin();
+	collecting = false;
+	// the same game on both sides, whatever each plays offline: the program's patches (the culling widescreen
+	// uses, the host's secret character, the WARNING shortened), the FREE PLAY notices hidden, the sound board
+	// held and the byte link (they cut the CPUs' time differently)
+	// (each only on the program known: the ROMs' hashes being the same, both sides patch alike)
+	// (Cheats' random fighters off, the ROMs as loaded, and everything they knew forgotten: on again below from the
+	// cold start, only when a player has one)
+	board.random_fighters_forget();
+	board.set_scenery_culling(MATCH_CULLING);
+	board.set_secret_character(secret);
+	board.shorten_warning();
+	board.hide_free_play_text();
+	if (program_changed) program_changed();
+	board.set_sound(false);
+	board.set_byte_link(true);
+	// a cold start on both (work RAM and more survive a reset: a side that had played would start out of step),
+	// from the host's backup RAM and EEPROM
+	auto cold = [&](const uint8_t *backup, const uint8_t *eeprom) {
+		board.power_on();
+		memcpy(board.backup_ram().data(), backup, backup_n);
+		memcpy(board.eeprom_cells(), eeprom, 64 * 2);
+	};
+	cold(blob.data() + 4, blob.data() + 4 + backup_n);
+	// a board never set up writes its settings as it starts (the host's first game ever): wait for them
+	for (int i = 0; i < 300 && board.coin_setting() < 0; i++) {
+		board.run_frame();
+		if (booting && i % 60 == 59) booting();
+	}
+	if (board.coin_setting() < 0 || board.assignment(model2a::game_assignment::vs_finish) < 0) return false;
+	// free play, and the winner of a versus playing on (the arcade's: the loser presses Start for a rematch)
+	board.set_coin_setting(model2a::COIN_FREE_PLAY);
+	board.set_assignment(model2a::game_assignment::vs_finish, 0);
+	const std::vector<uint8_t> backup = board.backup_ram();
+	std::vector<uint8_t> eeprom(64 * 2);
+	memcpy(eeprom.data(), board.eeprom_cells(), eeprom.size());
+	cold(backup.data(), eeprom.data());
+	// the players' random fighters (Cheats'), on only now, from the cold start's RAM, every random choice from the
+	// host's seed: the same on both sides (Random opponents offline only: no computer's opponent is anyone's online)
+	if (random) {
+		board.set_random_seed(seed);
+		set_players(board, fighters);
+		board.set_random_opponents(false);
+		if (!board.apply_random_fighters()) return false;
+		board.random_fighters_decode();   // (every texture one may take, now: none decoded mid-match, a frame of 100 ms on one side)
+		if (program_changed) program_changed();
+	}
+	// (the boot's bytes too, from this cold start, a frame's at a time: a sound board made for the match, alone, needs
+	// its set-up, and booting as this board boots, as the arcade's does, to take it: all at once on its first frame,
+	// its program not yet started, they were lost, and the character select had no music or sounds)
+	board.on_uart_tx = [this](uint8_t b) { if (collecting) pending.push_back(b); };
+	collecting = true;
+	pending.clear();
+	boot_sound.clear();
+	for (int i = 0; i < BOOT_FRAMES && !board.past_boot(); i++) {
+		board.run_frame();
+		boot_sound.push_back(std::move(pending));
+		pending.clear();
+		if (booting && i % 60 == 59) booting();
+	}
+	frame = 0;
+	if (const char *d = getenv("VF2_DUMP_BEGIN")) {   // (tests: the state the match starts from, and its parts)
+		std::vector<uint8_t> st;
+		std::vector<m2::StateSection> sec;
+		board.save_state(st, &sec);
+		if (FILE *f = fopen(d, "wb")) { fwrite(st.data(), 1, st.size(), f); fclose(f); }
+		if (FILE *f = fopen((std::string(d) + ".txt").c_str(), "w")) { for (auto &x : sec) fprintf(f, "%s %zu\n", x.name, x.offset); fclose(f); }
+	}
+	started_secret = secret;
+	sound_sent.clear();
+	checkpoints.clear();
+	return true;
+}
+
+uint64_t Adapter::hash(const std::vector<uint8_t> &state)
+{
+	const size_t skip = std::min(state.size(), model2a::STATE_HEADER);
+	return vfnet::hash64(state.data() + skip, state.size() - skip);
+}
+
+void Adapter::save(std::vector<uint8_t> &state)
+{
+	if (settle) settle();
+	board.save_state(state);
+	// (the frame number with it: a load puts the adapter back at that frame)
+	const size_t n = state.size();
+	state.resize(n + 4);
+	memcpy(state.data() + n, &frame, 4);
+}
+
+bool Adapter::load(const std::vector<uint8_t> &state)
+{
+	if (state.size() < 4) return false;
+	if (settle) settle();
+	memcpy(&frame, state.data() + state.size() - 4, 4);
+	pending.clear();
+	return board.load_state(state.data(), state.size() - 4);
+}
+
+void Adapter::advance(const uint16_t input[2], bool resim)
+{
+	unpack(input, board);
+	// random stages, as VF3's: a versus's first select after Start, its count of fights (0 from Start) put at the
+	// host's place in the list, the stage with it; the game counts on from there (from the board's RAM and the blob
+	// alone: the same on both sides)
+	{
+		auto &ram = const_cast<std::vector<u8> &>(board.workram());
+		if (board.game_mode() == 7 && ram[VERSUS] == 1 && ram[FIGHTS] == 0 && ram[STREAK] == 0 && stage_offset)
+			ram[FIGHTS] = ram[STAGE] = u8(stage_offset);
+	}
+	sound_taken = false;
+	if (run) run(resim);
+	else board.run_frame();
+	if (!sound_taken) {
+		std::vector<uint8_t> out;
+		take_sound(out);
+		if (!out.empty() && sound_out) sound_out(out);
+	}
+	frame++;
+	if (checkpoint_every && frame % checkpoint_every == 0) {
+		board.save_state(check_buf);
+		checkpoints[frame] = hash(check_buf);
+	}
+}
+
+uint8_t Score::players_in(const model2a &board)
+{
+	const uint8_t v = board.workram()[PLAYING];
+	if (v == 2) return 3;
+	if (v == 1) return 2;
+	return board.game_mode() == 9 ? 1 : 0;   // (player 1 alone, in a fight; else no one yet)
+}
+
+void Score::frame(const model2a &board)
+{
+	if (!known()) return;
+	const std::vector<uint8_t> &ram = board.workram();
+	const uint8_t r[3] = { ram[ROUNDS_P1], ram[ROUNDS_P2], players_in(board) };
+	if (memcmp(r, now, 3) != 0) { memcpy(now, r, 3); held = 0; return; }
+	if (++held != 30) return;   // (once, when it's held long enough)
+	playing = r[2];
+	for (int p = 0; p < 2; p++)
+		if (r[p] == seen[p] + 1) {
+			round_ends++;
+			if (seen[0] + seen[1] == 0) versus = playing == 3;   // (the match's first round)
+			if (playing != 3) versus = false;
+			if (versus) rounds[p]++;
+		}
+	if (r[0] == 0 && r[1] == 0 && seen[0] + seen[1] > 0) {   // (the match over: whoever had more won it)
+		if (versus && seen[0] != seen[1]) matches[seen[0] > seen[1] ? 0 : 1]++;
+		versus = false;
+	}
+	seen[0] = r[0];
+	seen[1] = r[1];
+}
+
+} // namespace vf2net

@@ -5,8 +5,7 @@ native code as the game starts, MAME's Model 2A board around it, SDL3 (Vulkan th
 renderer, the CPU's 3D as the fallback) in front. No game files are included: no ROMs, and nothing
 made from them. You need your own dump of the game as MAME's `vf2` set (`vf2.zip`, Version 2.1).
 
-The port's plan, the modules and what has been checked without a phone are in the repository's
-`vf2.md`. This file is the part a player needs: build it, install it, get a ROM in.
+This file is the part a player needs: build it, install it, get a ROM in.
 
 ## What it needs
 
@@ -14,8 +13,10 @@ The port's plan, the modules and what has been checked without a phone are in th
 - A Vulkan driver (essentially every phone since 2017 has one): the 3D can also run on the CPU,
   and the game falls back to it by itself if the GPU's picture differs or its driver fails.
 - Your own `vf2.zip`.
-- No permissions at all: the app declares none, has no network code, and keeps everything in its
-  own folders.
+- One permission, `INTERNET`, for Online's **Play by address** (UDP sockets). It is Android's
+  normal permission (no prompt). The app asks for nothing else and keeps everything in its own
+  folders. The lobby and its room codes need libcurl, which Android doesn't ship, so this build
+  has no lobby address in it: Online plays by address (the same network, or a VPN).
 
 ## Build
 
@@ -26,8 +27,11 @@ ANDROID_HOME=~/Android/Sdk ./gradlew :app:assembleDebug      # app/build/outputs
 
 It needs a JDK 17, the Android SDK (`ANDROID_HOME`/`ANDROID_SDK_ROOT`, or a `local.properties` with
 `sdk.dir=`), the SDK's CMake 3.22.1 and NDK 30.0.16248370 (both named in `app/build.gradle`).
-SDL3 and FreeType come from `third_party/` and are built by the same command, so nothing else is
-to be installed first. A first build takes a couple of minutes; later ones are seconds.
+SDL3 and FreeType are not in the repository: the build itself runs `tools/android/deps.sh`, which
+fetches their pinned release tarballs, checks them against the SHA-256 that `tools/mac/deps.sh`
+pins for the Mac and Deck builds, and unpacks them into `build/deps/android/`. Nothing else is to be
+installed first, and the tarballs are cached: a first build takes a couple of minutes, later ones
+are seconds.
 
 The APK is signed with the debug key: it installs by sideloading, not from the Play Store.
 
@@ -130,6 +134,21 @@ The desktop's function keys — F5/F6 render scale and picture shape, F9 frame t
 fullscreen, F12 a screenshot — need a keyboard; the menu covers all but the screenshot (the phone's
 own screenshot button works as ever).
 
+## Online
+
+**Play by address** works: Online > Host by address (or Join by address) plays a friend on the same
+network, or over a VPN, with no service in between; one side hosts, the other joins with the host's
+address and port. Both sides run the same game (the ROM's hash is checked) and the host's Rounds to
+win (vs player), 3 by default.
+
+The lobby — Online > Random, room codes, and the count on its card — needs libcurl, which Android
+doesn't ship, so this build carries no lobby address and those pages say so. Play by address is the
+way to play. A lobby can be built in with `.lobby-url` (one line, kept out of git) or `VF_LOBBY_URL`
+at build time, but it still needs libcurl at run time to reach it.
+
+Online's settings (your name, delay, max ping, the match-found chime, Your fighter's random or seed
+fighter) are in the game's menu and kept in `settings.ini` like the rest.
+
 ## The icons
 
 The launcher's icon is the desktop icon's art: `tools/release/make_icon.py --android steel_red`
@@ -139,17 +158,24 @@ filling the 108dp canvas, the letters inside the 66dp safe zone), which
 
 ## What is still owed
 
-The phone has run it: `i960 native` (SLJIT's executable memory works), the GPU's 3D exact against the
-CPU's on the Immortalis-G720, the menu, the touches, Back, the immersive landscape window and the sound
-all work, and the board holds the game's 57.5 frames a second. What is left (see `vf2.md`, Modules 11
-and 12):
+The phone has run it (v0.1.17, on a Xiaomi 14T Pro, Dimensity 9300+, Mali-G720 MC12): `i960 native`
+(SLJIT's executable memory works), the GPU's 3D exact against the CPU's, the menu (Online included), the
+touches, Back, the immersive landscape window, the sound and the on-screen keyboard all work, and the
+board holds the game's 57.5 frames a second.
+
+Online's **Play by address** was played against a desktop build over the same network: the handshake, a
+match running on both sides (input delay 1, ping ~24 ms, 0 rollbacks, no desync over 8600 frames) and the
+HUD's names all worked. Random fighters (Cheats) build and fight on the phone too.
+
+What is left:
 
 - The GPU's own 3D runs under the game's frame rate on a Dimensity 9300+, so **2x at full speed is the
-  CPU 3D's**; at 5x/6x a 15-18 ms texture upload appears.
+  CPU 3D's**; at 5x/6x a 15-18 ms texture upload appears. During an online match the phone still holds
+  57.5 frames/s at 4x.
+- The lobby and room codes need libcurl, which Android doesn't ship: this build carries no lobby address
+  (see **Online** above).
 - The governor still walks the render scale down from 2x to 1x while the frames and pictures are whole:
   it costs sharpness and buys nothing.
-- `Display > Performance hints` and the new `the GPU at:` clock line in `log.txt` have not had their
-  A/B run on the phone yet.
 - Player 2 has no on-screen pad (a second gamepad or a keyboard plays them).
 - Only arm64 is built, and the 2D renderer's `Surface.setFrameRate` idea (forcing the surface's refresh
   rate) is parked.

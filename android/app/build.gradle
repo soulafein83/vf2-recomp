@@ -4,7 +4,7 @@ plugins {
 
 // The version follows git, as the native code's does (app/CMakeLists.txt's VF2_VERSION, which the
 // menu's footer shows): the name is git describe, and the code the name's major.minor.patch
-// (v0.1.9 -> 109), so Android sees each tagged build as an upgrade. No git (a source tarball,
+// (v0.1.15 -> 115), so Android sees each tagged build as an upgrade. No git (a source tarball,
 // or a fetch that doesn't include the tag): 0.1.0, code 1.
 def gitText = { List<String> args ->
     try {
@@ -108,3 +108,14 @@ def clearPackagedApks = tasks.register('clearPackagedApks') {
 tasks.matching { it.name == 'packageDebug' || it.name == 'packageRelease' }.configureEach {
     dependsOn clearPackagedApks
 }
+
+// SDL3 and FreeType are not in the repository: tools/android/deps.sh fetches their pinned release
+// tarballs, checks the SHA-256 and unpacks them into build/deps/android, where CMakeLists.txt
+// builds them. It runs before CMake configures, on every build: the check is a pair of hashes, so
+// a truncated download or an edited tarball fails the build rather than changing the game.
+def fetchAndroidDeps = tasks.register('fetchAndroidDeps', Exec) {
+    workingDir rootProject.projectDir
+    commandLine 'sh', rootProject.file('../tools/android/deps.sh').absolutePath
+}
+tasks.matching { it.name.startsWith('configureCMake') || it.name.startsWith('externalNativeBuild') }
+    .configureEach { dependsOn fetchAndroidDeps }

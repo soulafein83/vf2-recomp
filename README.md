@@ -23,8 +23,10 @@ recompiler, MAME's Model 2A board, the renderers and the desktop builds are upst
 the phone only. For everything else, from the desktop downloads to the controls and the credits, see the
 [upstream README](https://github.com/mr-finster/vf2-recomp#readme).
 
-The fork is based on upstream **v0.1.15**: upstream's GPU fallback and crash handling, background saves,
-fullscreen keys and the rest of v0.1.10–v0.1.15 are in, and every Android addition is kept on top of them.
+The fork is based on upstream **v0.1.17**: online play (with rollback), the random fighters, the HUD flags
+and everything else from v0.1.10 on are in, and every Android addition is kept on top of them. On the phone
+**Online > Play by address** works (the same network, or a VPN) — the lobby and its room codes need libcurl,
+which Android doesn't ship, so they say so; see [android/README.md](android/README.md).
 
 The port in more detail: [android/README.md](android/README.md) (the same instructions as below, for a
 player: build, install, ROM, controls), [vf2.md](vf2.md) (the port's plan and every phone run's numbers,
@@ -44,7 +46,7 @@ sideload it, as it is not on the Play Store.
 
 | Piece | What it is |
 | --- | --- |
-| The Android port | `android/`: a Gradle 8.12 + AGP 8.7.3 project driving the NDK's CMake (NDK 30.0.16248370, SDK CMake 3.22.1, `arm64-v8a`, minSdk 26, targetSdk 34), with SDL 3 and FreeType from `third_party/` |
+| The Android port | `android/`: a Gradle 8.12 + AGP 8.7.3 project driving the NDK's CMake (NDK 30.0.16248370, SDK CMake 3.22.1, `arm64-v8a`, minSdk 26, targetSdk 34), with SDL 3 and FreeType fetched at build time (`tools/android/deps.sh`) |
 | The host on Android | SDL's entry point and lifecycle (the sound stops in the background), the APK's `assets/` copied out once into the app's own folder, the `content://` ROM picker, immersive fullscreen and a landscape window, on-screen controls, Android's Back as the menu key, AAudio's *game* role, the launcher icon and git-based versioning |
 | Mali / Vulkan | the GPU device is created with `SDL_CreateGPUDeviceWithProperties` and clip distance, depth clamping, indirect-first-instance and anisotropy **off** — the same insurance SDL's own GPU renderer takes, without which SDL "excludes every Mali GPU" ([SDL #12652](https://github.com/libsdl-org/SDL/issues/12652); SDL's renderer does it, our fallback device path did not) |
 | Settings a phone needs | `Display > Vsync` (`0` asks for mailbox first — what lifted 2x here from 33 to 38-48 pictures/s), `Display > GPU frames in flight`, `Display > Performance hints` (Android 13 and up: the platform's own way of keeping the frame's threads and the GPU at their clocks), `Display > On-screen controls` |
@@ -64,7 +66,7 @@ sideload it, as it is not on the Play Store.
 | `android/` (new) | the whole Gradle + CMake project: `build.gradle`, `app/CMakeLists.txt` (mirrors the Makefile's sources; `-O2` for the Debug type, without which the game ran at ~8 fps), the manifest, SDL's Java side, the icons, and `android/README.md` |
 | `src/host/touch_controls.h` (new) | the on-screen pad: a d-pad, guard/punch/kick, Start and Menu, drawn in the renderer's logical coordinates and read per finger |
 | `tools/gpu3dbench.cpp`, `tools/touchcheck.cpp`, `tools/audiocheck.cpp` (new) | the three checks above |
-| `third_party/sdl3`, `third_party/freetype` (vendored) | the phone build uses these copies (`pkg-config`'s SDL 3 and FreeType are still what the desktop build uses) |
+| `tools/android/deps.sh` (new) | SDL 3.4.18 and FreeType 2.14.3 are **fetched at build time**, not vendored: the same pinned tarballs and SHA-256 checksums as `tools/mac/deps.sh`, unpacked into `build/deps/android/` (gitignored) and compiled by the NDK's toolchain. `pkg-config`'s SDL 3 and FreeType are still what the desktop build uses |
 | `docs/ARM-IMMORTALIS-G720.md`, `vf2.md`, `analiza.md` (new) | the GPU notes, the port's plan and log, and the analysis of the two suggestion notes |
 
 ### What deliberately does not differ
@@ -72,8 +74,9 @@ sideload it, as it is not on the Play Store.
 - **The desktop builds play as upstream's.** Every Android branch is behind `#ifdef __ANDROID__`, and the two
   new display settings fall back to SDL's own values off Android (`frames in flight 1`, performance hints
   off), the GPU clock line is simply absent where there is no `devfreq`, and nothing else changes.
-- **`third_party/sdl3` is verbatim.** SDL's own `AGENTS.md` asks for no AI-generated contributions, so every
-  change lives in our `src/` or in `android/`.
+- **SDL 3 and FreeType are upstream's, untouched.** Nothing of theirs is in the tree any more: `tools/android/deps.sh`
+  fetches the pinned release tarballs and checks their SHA-256, so SDL's own `AGENTS.md` (no AI-generated
+  contributions) is respected and every change lives in our `src/` or in `android/`.
 - **The recompiler, the address map, the machine and the renderers are untouched** — including the CPU/GPU 3D
   paths and their pixel-for-pixel check.
 
@@ -110,10 +113,10 @@ on the start-up test scene; an on-screen pad for player 2; and the 2D renderer's
 
 | | |
 | --- | --- |
-| Phone | arm64, Android 8.0 (API 26) or newer. A Vulkan driver is expected but not required — the 3D can run on the CPU, and the game falls back to it by itself. No permission is asked for at all |
+| Phone | arm64, Android 8.0 (API 26) or newer. A Vulkan driver is expected but not required — the 3D can run on the CPU, and the game falls back to it by itself. One permission, `INTERNET`, for Online's play by address (Android's normal one, no prompt); nothing else |
 | Build machine | Linux, macOS or Windows with a **JDK 17** or newer (the module compiles for Java 17) |
 | Android SDK | `platform-tools`, `platforms;android-34`, `build-tools;34.0.0`, **CMake 3.22.1** and **NDK 30.0.16248370** — the last two are named in `android/app/build.gradle` |
-| The repository | SDL 3 and FreeType are vendored in `third_party/` and are built by the same command: nothing to fetch, and no submodules |
+| The repository | nothing to install by hand: the build itself runs `tools/android/deps.sh`, which fetches SDL 3 and FreeType from their pinned release tarballs and checks their SHA-256. A first build needs the internet (a couple of minutes); later ones are seconds, and there are no submodules |
 | ROM | your own `vf2.zip` (MAME's `vf2` set, Version 2.1) |
 
 ## Build it, step by step
@@ -133,8 +136,8 @@ on the start-up test scene; an on-screen pad for player 2; and the 2D renderer's
 
    or with a file `android/local.properties` holding `sdk.dir=/home/you/Android/Sdk`.
 
-3. Build the debug APK. The first build also compiles SDL 3 and FreeType and takes a couple of minutes; later
-   ones are seconds.
+3. Build the debug APK. The first build fetches SDL 3 and FreeType (from their pinned tarballs, the sums
+   checked) and compiles them, and takes a couple of minutes; later ones are seconds.
 
    ```
    cd android
@@ -143,7 +146,7 @@ on the start-up test scene; an on-screen pad for player 2; and the 2D renderer's
 
 4. The APK is `android/app/build/outputs/apk/debug/app-debug.apk`, signed with the debug key (it installs by
    sideloading, not from the Play Store). Its `versionName` is `git describe` (a tag, or the tag and commit),
-   and its `versionCode` is that name's major.minor.patch (`115` for `v0.1.15`), so each tagged build is an
+   and its `versionCode` is that name's major.minor.patch (`117` for `v0.1.17`), so each tagged build is an
    upgrade.
 
 ## Run it, step by step

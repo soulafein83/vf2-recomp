@@ -363,10 +363,14 @@ double i960_cpu_device::get_2_rif(uint32_t opcode)
 	}
 }
 
+// (vf2-recomp: a NaN stored as one pattern, x86's own, on every machine, as src/rec/i960_ops.h's)
+static double nan_fixed(double v) { return v != v ? u2d(0xfff8000000000000ull) : v; }
+
 void i960_cpu_device::set_rif(uint32_t opcode, double val)
 {
+	val = nan_fixed(val);
 	if(!(opcode & 0x00002000))
-		m_r[(opcode>>19) & 0x1f] = f2u(val);
+		m_r[(opcode>>19) & 0x1f] = val != val ? 0xffc00000u : f2u(val);
 	else if(!(opcode & 0x00e00000))
 		m_fp[(opcode>>19) & 3] = val;
 	else
@@ -407,6 +411,7 @@ double i960_cpu_device::get_2_rifl(uint32_t opcode)
 
 void i960_cpu_device::set_rifl(uint32_t opcode, double val)
 {
+	val = nan_fixed(val);
 	if(!(opcode & 0x00002000)) {
 		uint64_t v = d2u(val);
 		m_r[(opcode>>19) & 0x1e] = v;
@@ -1834,25 +1839,25 @@ void i960_cpu_device::execute_op(uint32_t opcode)
 			case 0x0: // cvtri
 				m_icount -= 33;
 				t1f = get_1_rif(opcode);
-				set_ri(opcode, (int32_t)round_to_int(t1f));
+				set_ri(opcode, f2s32(round_to_int(t1f)));   // (as x86-64 on every machine: mame_shim.h)
 				break;
 
 			case 0x1: // cvtril
 				m_icount -= 35;
 				t1f = get_1_rif(opcode);
-				set_ri64(opcode, (int64_t)round_to_int(t1f));
+				set_ri64(opcode, f2s64(round_to_int(t1f)));
 				break;
 
 			case 0x2: // cvtzri
 				m_icount -= 43;
 				t1f = get_1_rif(opcode);
-				set_ri(opcode, (int32_t)t1f);
+				set_ri(opcode, f2s32(t1f));
 				break;
 
 			case 0x3: // cvtzril
 				m_icount -= 44;
 				t1f = get_1_rif(opcode);
-				set_ri64(opcode, (int64_t)t1f);
+				set_ri64(opcode, f2s64(t1f));
 				break;
 
 			case 0x9: // movr

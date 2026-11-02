@@ -24,9 +24,17 @@ VF2_VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 VF2_DATE ?= $(shell git log -1 --format=%cd --date=format:'%b %-d %Y' 2>/dev/null)
 # (the commit too: what a GPU failure is remembered by, src/host/main.cpp's BUILD)
 VF2_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null)
+# and the lobby the room codes use (VF3's, shared: vf3-recomp/tools/lobby): its https address, .lobby-url's (one line, kept out of git) if unset or
+# empty, "none" for none
+ifeq ($(strip $(VF_LOBBY_URL)),)
+VF_LOBBY_URL := $(strip $(shell cat .lobby-url 2>/dev/null))
+endif
+ifeq ($(VF_LOBBY_URL),none)
+VF_LOBBY_URL :=
+endif
 $(OBJ)/version.h: FORCE
 	@mkdir -p $(OBJ)
-	@printf '#define VF2_VERSION "%s"\n#define VF2_DATE "%s"\n#define VF2_COMMIT "%s"\n' "$(VF2_VERSION)" "$(VF2_DATE)" "$(VF2_COMMIT)" > $@.tmp
+	@printf '#define VF2_VERSION "%s"\n#define VF2_DATE "%s"\n#define VF2_COMMIT "%s"\n#define VF_LOBBY_URL "%s"\n' "$(VF2_VERSION)" "$(VF2_DATE)" "$(VF2_COMMIT)" "$(VF_LOBBY_URL)" > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 FORCE:
 
@@ -34,11 +42,13 @@ FORCE:
 # runtime (src/rec: the code found with the address map, src/rec/vf2_map.cpp, made native at start-up)
 CORE = third_party/mame/i960/i960.cpp third_party/mame/i960/i960dis.cpp src/core/mame_shim.cpp src/core/mb86233.cpp \
 	src/core/i960_device.cpp src/rec/i960_rec.cpp src/rec/i960_analyse.cpp src/rec/i960_native.cpp src/rec/vf2_map.cpp
-MACHINE = src/machine/model2a.cpp src/machine/model2_video.cpp src/machine/model2_smooth.cpp src/machine/scsp.cpp src/machine/scspdsp.cpp
+MACHINE = src/machine/model2a.cpp src/machine/random_fighter.cpp src/machine/hud_names.cpp src/machine/model2_video.cpp src/machine/model2_smooth.cpp src/machine/scsp.cpp src/machine/scspdsp.cpp
 # MAME's 68000 (the sound board's CPU): the generated instruction handlers, unchanged
 M68000 = third_party/mame/m68000/m68000.cpp third_party/mame/m68000/m68000-decode.cpp \
 	third_party/mame/m68000/m68000-sdf.cpp third_party/mame/m68000/m68000-sdp.cpp
 HOST = src/host/romset.cpp src/host/input_script.cpp
+# Netplay (src/net, VF3's, kept the same in all three): the game's Online play
+NET_SRC = src/net/session.cpp src/net/link.cpp src/net/room_link.cpp src/net/stun.cpp src/net/http.cpp
 
 
 # SLJIT (BSD-2): the native code made at start-up. C, built by the C++ compiler's driver (-x c), so
@@ -60,14 +70,22 @@ $(OBJ)/%.o: %.cpp
 # reference's pictures exactly, for checking; it then needs FMA (Intel 2013 Haswell, AMD 2012 on).
 $(OBJ)/src/machine/model2_video.o $(OBJ)/src/machine/model2_smooth.o: CXXFLAGS += $(RENDER_FLAGS)
 
+# The game's own float arithmetic (the i960's floating point in the interpreter and the native code's
+# helpers, the TGP's ALU, the board): one rounding an operation on every machine, so that two in a
+# netplay match (an Apple silicon Mac's clang would fuse a * b + c, an x86-64 PC can't) run the
+# same game. Not the renderer's (the picture's alone, above). Cheats' random fighters' too: their colours are in the
+# game's tables (online, both sides make them from the match's seed)
+GAME_FLAGS = -ffp-contract=off
+$(call objs,$(CORE) src/machine/model2a.cpp src/machine/random_fighter.cpp): CXXFLAGS += $(GAME_FLAGS)
+
 # RmlUi (MIT, third_party/rmlui): the in-game menu. Its core and the SDL backend, built with FreeType.
 RML_SRC = $(wildcard third_party/rmlui/Source/Core/*.cpp third_party/rmlui/Source/Core/*/*.cpp) \
 	third_party/rmlui/Backends/RmlUi_Platform_SDL.cpp third_party/rmlui/Backends/RmlUi_Renderer_SDL.cpp
 RML_CFLAGS = -DRMLUI_STATIC_LIB -DRMLUI_FONT_ENGINE_FREETYPE -DRMLUI_SDL_VERSION_MAJOR=3 -Ithird_party/rmlui/Include -Ithird_party/rmlui/Backends
 $(OBJ)/third_party/rmlui/%.o: CXXFLAGS += $(RML_CFLAGS) $(FT_CFLAGS) $(SDL_CFLAGS) -w
-$(OBJ)/src/host/main.o $(OBJ)/src/host/menu.o $(OBJ)/src/host/sysinfo.o $(OBJ)/src/host/d3d11_map.o: CXXFLAGS += $(SDL_CFLAGS) $(RML_CFLAGS)
-$(OBJ)/src/host/main.o: $(OBJ)/version.h
-$(OBJ)/src/host/main.o: CXXFLAGS += -I$(OBJ)
+$(OBJ)/src/host/main.o $(OBJ)/src/host/menu.o $(OBJ)/src/host/online.o $(OBJ)/src/host/sysinfo.o $(OBJ)/src/host/d3d11_map.o: CXXFLAGS += $(SDL_CFLAGS) $(RML_CFLAGS)
+$(OBJ)/src/host/main.o $(OBJ)/src/host/online.o: $(OBJ)/version.h
+$(OBJ)/src/host/main.o $(OBJ)/src/host/online.o: CXXFLAGS += -I$(OBJ)
 
 $(OBJ)/src/host/stb_image_impl.o: CXXFLAGS += -w
 
@@ -91,7 +109,7 @@ $(OBJ)/src/gpu/gpu3d_sdlgpu.o: CXXFLAGS += $(SDL_CFLAGS)
 $(OBJ)/src/host/main.o: CXXFLAGS += -DVF2_GPU3D_SDL=1
 endif
 
-$(BIN)/vf2: $(call objs,src/host/main.cpp src/host/menu.cpp src/host/sysinfo.cpp src/host/d3d11_map.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(RML_SRC)) $(SLJIT_OBJ) $(GPU3D_OBJ)
+$(BIN)/vf2: $(call objs,src/host/main.cpp src/host/menu.cpp src/host/online.cpp src/host/vf2_netplay.cpp $(NET_SRC) src/host/sysinfo.cpp src/host/d3d11_map.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(RML_SRC)) $(SLJIT_OBJ) $(GPU3D_OBJ)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) $(SDL_LIBS) $(FT_LIBS) $(GPU3D_LIBS)
 
@@ -106,6 +124,60 @@ $(BIN)/vf2dis: $(call objs,tools/vf2dis.cpp $(HOST) $(CORE) $(GEN_NONE)) $(SLJIT
 $(BIN)/vf2run: $(call objs,tools/vf2run.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000)) $(SLJIT_OBJ)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+# Netplay (src/net): rollback sessions and their links, nothing of the game's (the same files as VF1's and VF3's)
+NET = src/net/session.cpp src/net/link.cpp src/net/room_link.cpp src/net/stun.cpp src/net/http.cpp
+
+# nettest: the session on a simulated network with a stand-in game (no ROM)
+$(BIN)/nettest: $(call objs,$(NET) tools/nettest.cpp)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@
+
+# delaytest: Auto's input delay against simulated pings (full speed at any; raised and lowered as it should)
+$(BIN)/delaytest: $(call objs,$(NET) tools/delaytest.cpp)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@
+
+# roomtest: room links against a TURN server on 127.0.0.1:3478 (coturn: tools/roomtest.cpp)
+$(BIN)/roomtest: $(call objs,$(NET) tools/roomtest.cpp)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+# netfuzz: the session against a peer who sends anything, with AddressSanitizer and UBSan (its own objects)
+$(BIN)/netfuzz: $(NET) tools/netfuzz.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer $^ -o $@
+
+# The rollback soak test (tools/vf2soak.cpp): two boards, one rolled back every frame, byte for byte the same
+$(BIN)/vf2soak: $(call objs,tools/vf2soak.cpp src/host/vf2_netplay.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(NET)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+# vf2net: two boards, each with its own session, through a simulated network, checked against a straight run
+$(BIN)/vf2net: $(call objs,tools/vf2net.cpp src/host/vf2_netplay.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(NET)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+# vf2random: Cheats' random fighters headless (a script's shots with each side's fighter and name; the seed book)
+$(BIN)/vf2random: $(call objs,tools/vf2random.cpp src/host/vf2_netplay.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(NET)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+# vf2detect: the game's round counters and who's playing, from RAM (the netplay Score's places)
+$(BIN)/vf2detect: $(call objs,tools/vf2detect.cpp src/host/vf2_netplay.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(NET)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+# vf2soundonly: online play's sound board alone (model2a::set_sound_only) against the game's own
+$(BIN)/vf2soundonly: $(call objs,tools/vf2soundonly.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+# menutest: the Online pages as pictures, no ROM (a made-up one builds the board; SDL_VIDEO_DRIVER=offscreen)
+$(OBJ)/tools/menutest.o: CXXFLAGS += $(SDL_CFLAGS) $(RML_CFLAGS)
+$(BIN)/menutest: $(call objs,tools/menutest.cpp src/host/menu.cpp src/host/online.cpp src/host/vf2_netplay.cpp $(NET_SRC) $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(RML_SRC)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) $(SDL_LIBS) $(FT_LIBS)
 
 clean:
 	rm -rf $(OBJ) $(BIN)

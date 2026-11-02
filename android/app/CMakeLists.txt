@@ -16,13 +16,26 @@ set(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
 get_filename_component(REPO_ROOT "${REPO_ROOT}" ABSOLUTE)
 
 # ---------------------------------------------------------------- dependencies
+# Neither SDL3 nor FreeType is in the repository: tools/android/deps.sh fetches their pinned
+# release tarballs, checks them against the SHA-256 tools/mac/deps.sh pins, and unpacks them into
+# build/deps/android (Gradle runs it before this configure). The versions are that script's.
+set(VF2_DEPS_DIR "${REPO_ROOT}/build/deps/android" CACHE PATH
+    "where tools/android/deps.sh unpacks SDL3 and FreeType")
+set(VF2_SDL3_DIR "${VF2_DEPS_DIR}/SDL3-3.4.18")
+set(VF2_FREETYPE_DIR "${VF2_DEPS_DIR}/freetype-2.14.3")
+if(NOT EXISTS "${VF2_SDL3_DIR}/CMakeLists.txt" OR NOT EXISTS "${VF2_FREETYPE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "SDL3 and FreeType are not in ${VF2_DEPS_DIR}.\n"
+        "Run tools/android/deps.sh first (Gradle does: ./gradlew :app:assembleDebug).")
+endif()
+
 # SDL3 (shared: libSDL3.so, loaded by the SDLActivity Java side).
 set(SDL_SHARED ON  CACHE BOOL "" FORCE)
 set(SDL_STATIC OFF CACHE BOOL "" FORCE)
 set(SDL_TESTS OFF CACHE BOOL "" FORCE)
 set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
-add_subdirectory("${REPO_ROOT}/third_party/sdl3" "${CMAKE_BINARY_DIR}/sdl3")
+add_subdirectory("${VF2_SDL3_DIR}" "${CMAKE_BINARY_DIR}/sdl3")
 
 # FreeType (static; RmlUi's font engine). zlib comes from the NDK sysroot.
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -30,7 +43,7 @@ set(FT_DISABLE_BZIP2 TRUE CACHE BOOL "" FORCE)
 set(FT_DISABLE_PNG TRUE CACHE BOOL "" FORCE)
 set(FT_DISABLE_HARFBUZZ TRUE CACHE BOOL "" FORCE)
 set(FT_DISABLE_BROTLI TRUE CACHE BOOL "" FORCE)
-add_subdirectory("${REPO_ROOT}/third_party/freetype" "${CMAKE_BINARY_DIR}/freetype")
+add_subdirectory("${VF2_FREETYPE_DIR}" "${CMAKE_BINARY_DIR}/freetype")
 
 # SLJIT (BSD-2): the i960's native code, made at start-up (mirrors the Makefile).
 add_library(sljit STATIC "${REPO_ROOT}/third_party/sljit/sljitLir.c")
@@ -54,15 +67,21 @@ add_custom_target(vf2_version ALL
 
 # ------------------------------------------------------------- the game's code
 set(VF2_APP
-    src/host/main.cpp src/host/menu.cpp src/host/sysinfo.cpp
+    src/host/main.cpp src/host/menu.cpp src/host/online.cpp src/host/vf2_netplay.cpp
+    src/host/sysinfo.cpp
     src/host/d3d11_map.cpp src/host/stb_image_impl.cpp
     src/rec/gen_none.cpp
     src/gpu/gpu3d_sdlgpu.cpp)                 # SDL_GPU (Vulkan on Android)
 set(VF2_MACHINE
-    src/machine/model2a.cpp src/machine/model2_video.cpp
+    src/machine/model2a.cpp src/machine/random_fighter.cpp src/machine/hud_names.cpp
+    src/machine/model2_video.cpp
     src/machine/model2_smooth.cpp src/machine/scsp.cpp src/machine/scspdsp.cpp)
 set(VF2_HOST
     src/host/romset.cpp src/host/input_script.cpp)
+# Netplay (src/net, VF3's, kept the same in all three): the game's Online play
+set(VF2_NET
+    src/net/session.cpp src/net/link.cpp src/net/room_link.cpp
+    src/net/stun.cpp src/net/http.cpp)
 set(VF2_CORE
     third_party/mame/i960/i960.cpp third_party/mame/i960/i960dis.cpp
     src/core/mame_shim.cpp src/core/mb86233.cpp src/core/i960_device.cpp
@@ -79,7 +98,7 @@ list(APPEND VF2_RML
     "${REPO_ROOT}/third_party/rmlui/Backends/RmlUi_Renderer_SDL.cpp")
 
 # Prefix the repository-relative lists with REPO_ROOT.
-foreach(group VF2_APP VF2_MACHINE VF2_HOST VF2_CORE VF2_M68000)
+foreach(group VF2_APP VF2_MACHINE VF2_HOST VF2_NET VF2_CORE VF2_M68000)
     set(abs "")
     foreach(f ${${group}})
         list(APPEND abs "${REPO_ROOT}/${f}")
@@ -87,8 +106,17 @@ foreach(group VF2_APP VF2_MACHINE VF2_HOST VF2_CORE VF2_M68000)
     set(${group} "${abs}")
 endforeach()
 
+# The game's own float arithmetic (the i960's floating point in the interpreter and the native
+# code's helpers, the TGP's ALU, the board): one rounding an operation on every machine, so that
+# two in a netplay match run the same game (arm64's clang would fuse a * b + c otherwise). Not the
+# renderer's, which is the picture's alone.
+set_source_files_properties(${VF2_CORE}
+    "${REPO_ROOT}/src/machine/model2a.cpp"
+    "${REPO_ROOT}/src/machine/random_fighter.cpp"
+    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+
 add_library(main SHARED
-    ${VF2_APP} ${VF2_MACHINE} ${VF2_HOST} ${VF2_CORE} ${VF2_M68000} ${VF2_RML})
+    ${VF2_APP} ${VF2_MACHINE} ${VF2_HOST} ${VF2_NET} ${VF2_CORE} ${VF2_M68000} ${VF2_RML})
 add_dependencies(main vf2_version)
 
 target_compile_features(main PRIVATE cxx_std_20)
@@ -101,7 +129,7 @@ target_include_directories(main PRIVATE
     "${REPO_ROOT}/src/core/shim_include"
     "${REPO_ROOT}/third_party/rmlui/Include"
     "${REPO_ROOT}/third_party/rmlui/Backends"
-    "${REPO_ROOT}/third_party/freetype/include"
+    "${VF2_FREETYPE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}")            # version.h
 
 # RmlUi and stb are third-party: no warnings (as in the Makefile).
@@ -112,4 +140,4 @@ target_link_libraries(main PRIVATE
     SDL3::SDL3
     freetype
     sljit
-    z log android)
+    z log android dl)
