@@ -66,12 +66,30 @@ bool random_version(const std::string &v)
 	return v.size() > n && v.compare(v.size() - n, n, RANDOM_TAG) == 0;
 }
 
+std::string pool_version(const std::string &online)
+{
+	return online.substr(0, online.find('+')) + MIX_TAG;
+}
+
+bool terms_of(const std::string &terms, const std::string &own, const std::string &pool, bool &random_fighters)
+{
+	random_fighters = false;
+	if (terms == pool) { random_fighters = true; return true; }
+	const std::string base = own.substr(0, own.find('+'));
+	if (terms == base) return true;
+	if (terms == base + RANDOM_TAG) { random_fighters = true; return true; }
+	return false;
+}
+
 // [magic "VF2B"][backup RAM][EEPROM][secret][stage]
 std::vector<uint8_t> start_blob(const model2a &b, int secret)
 {
 	std::vector<uint8_t> out(4);
 	memcpy(out.data(), &BLOB_MAGIC, 4);
-	const std::vector<uint8_t> &backup = b.backup_ram();
+	// the host's backup RAM with Rounds to win (vs player) at ONLINE_VS_ROUNDS, in this copy only (the host's own setting
+	// kept for offline): the guest plays the blob's as it is, so every match is first to 3, against older builds too
+	std::vector<uint8_t> backup = b.backup_ram();
+	model2a::set_vs_rounds_in(backup, ONLINE_VS_ROUNDS);
 	out.insert(out.end(), backup.begin(), backup.end());
 	const uint8_t *e = reinterpret_cast<const uint8_t *>(b.eeprom_cells());
 	out.insert(out.end(), e, e + 64 * 2);

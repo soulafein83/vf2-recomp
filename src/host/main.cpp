@@ -70,7 +70,7 @@
 // lowered a step at a time, down to 1 (for this run: the player's own choice is what's saved).
 //
 // --aspect sets the picture's shape; F6 steps through them. The default, fit, follows the window's
-// shape (between 4:3 and 32:9); the others keep theirs, with black bars. 4:3 is the arcade's
+// shape (between 4:3 and 80:9: five 16:9 screens side by side); the others keep theirs, with black bars. 4:3 is the arcade's
 // screen. Wider, the fights (the attract's demos too) see more to the sides: the 3D's view opens
 // out (the same vertical view, Hor+), the stage's backdrop panorama carries on and the scenery
 // the game leaves out by its 4:3 view is drawn; the HUD and text stay in the middle 4:3. The other
@@ -844,12 +844,14 @@ struct settings
 	//      this version, so the player never chose it) to 1, the new default; the GPU's failures
 	//      saved by older builds forgotten once
 	//   4: Rounds to win (vs player) 2 (the factory's, every player's until now) to 3, VF3's and the tournaments' (in the
-	//      game's own settings, as the boot starts: vs_rounds_to_3); a 2 chosen later is kept. The
-	//      merged build's files may already say 3, so its GPU failures are forgotten below 4
-	static constexpr int VERSION = 4;
+	//      game's own settings, as the boot starts: vs_rounds_to_3); a 2 chosen later is kept
+	//   5: the same once more, for everyone (2 Nov: online matches always first to 3, the offline setting 3 too): a 2
+	//      kept in the NVRAM by an install whose settings.ini was then deleted had never moved. No settings.ini at all
+	//      moves it too (the NVRAM may be an old one's); a 2 chosen after the move is kept (the file then says 5)
+	static constexpr int VERSION = 5;   // (3: GPU failures saved by older builds forgotten once)
 	int version = VERSION;
 	bool upgraded = false;   // (an upgrade made as it was read: saved at once)
-	bool vs_rounds_to_3 = false;   // (version 4's, for the boot: the game's settings aren't read yet)
+	bool vs_rounds_to_3 = true;   // (version 5's, for the boot: the game's settings aren't read yet; no settings.ini: on)
 	// the 3D's renderer (Display > 3D renderer): 0 the CPU, 1 the GPU, 2 Auto (whichever is faster
 	// here); the GPU's quality (0 exact, 1 fast); and Auto's choices so far on this machine, by
 	// scale and antialiasing ("3x1:g 2x1:c": a start there starts on that one, then checks it)
@@ -923,7 +925,8 @@ struct settings
 			music = 50; upgraded = true;
 			fprintf(stderr, "settings: the music volume 20 (the old default) moved to 50, the new one\n");
 		}
-		if (version < 4) { vs_rounds_to_3 = true; upgraded = true; }
+		vs_rounds_to_3 = version < 5;
+		if (vs_rounds_to_3) upgraded = true;
 		version = VERSION;
 		num("effects_volume", effects, 0, 100);
 		num("screen_filter", filter, 0, 2);
@@ -1442,9 +1445,11 @@ int main(int argc, char **argv)
 			// player's choice after that kept
 			m.set_assignment(model2a::game_assignment::match_vs, 3);
 		}
-		// (settings.ini from before version 4: a 2, the old default, to 3 once, as a new player's)
+		// (settings.ini from before version 5, or none: a 2, the old default, to 3 once, as a new player's; settings.ini
+		// written, so a 2 chosen after stays)
 		if (cfg.vs_rounds_to_3) {
 			cfg.vs_rounds_to_3 = false;
+			cfg_dirty = true;
 			if (m.assignment(model2a::game_assignment::match_vs) == 2 && m.set_assignment(model2a::game_assignment::match_vs, 3)) {
 				fprintf(stderr, "settings: Rounds to win (vs player) 2 (the old default) moved to 3, the new one\n");
 				save_nvram(false);
@@ -1787,13 +1792,13 @@ int main(int argc, char **argv)
 			perf_hints_up = sysinfo::perf_hints_start(row_pool::get().worker_tids(), int64_t(1e9 / FRAME_HZ));
 #endif
 	};
-	// The picture's shape: the chosen one, or the window's (fit: between 4:3 and 32:9)
+	// The picture's shape: the chosen one, or the window's (fit: between 4:3 and 80:9)
 	auto window_aspect = [&] {
 		int w = 0, h = 0;
 		SDL_GetWindowSizeInPixels(win, &w, &h);
 		if ((SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) && (SDL_GetWindowFlags(win) & SDL_WINDOW_HIDDEN))   // (it takes the screen's size once shown)
 			if (const SDL_DisplayMode *dm = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay())) { w = dm->w; h = dm->h; }
-		return h > 0 ? std::clamp(float(w) / float(h), 4.0f / 3.0f, 32.0f / 9.0f) : 16.0f / 9.0f;
+		return h > 0 ? std::clamp(float(w) / float(h), 4.0f / 3.0f, 80.0f / 9.0f) : 16.0f / 9.0f;
 	};
 	auto apply_aspect = [&] {   // true if the picture's shape changed
 		const float a = ASPECTS[aspect_i] > 0 ? ASPECTS[aspect_i] : window_aspect();
@@ -1829,7 +1834,12 @@ int main(int argc, char **argv)
 		const int most = cores >= 8 ? DEFAULT_MAX_SCALE : cores >= 6 ? 3 : 2;
 		scale = std::clamp(int(std::ceil(tall / double(model2a::HEIGHT) - 0.1)), 2, std::max(2, most));
 	}
-	auto aa_fit = [](int s, int a) { return std::max(1, std::min(a, 8 / s)); };   // (0, Low: at the scale, the 3D's edges smoothed)
+	// The picture drawn at most as wide as 32:9 at 8x (10,576 pixels: 80:9's 3,306 at 8x would be 26,448, and
+	// its buffers 1.5 GB): wider shapes at a lower scale and antialiasing, the player's own kept for narrower
+	auto scale_most = [&] { return std::max(1, (model2a::WIDTH + 2 * 413) * 8 / m.width()); };
+	int scale_wanted = scale;   // (the scale asked for, the player's or the governor's, before the width's limit)
+	scale = std::min(scale, scale_most());
+	auto aa_fit = [&](int s, int a) { return std::max(1, std::min({ a, 8 / s, scale_most() / std::max(1, s) })); };   // (0, Low: at the scale, the 3D's edges smoothed)
 	m.set_render_scale(scale * aa_fit(scale, aa));
 	m.set_edge_aa(aa == 0);
 	auto aa_now = [&] { return m.render_scale() / std::max(1, scale); };   // the antialiasing in use
@@ -2079,8 +2089,14 @@ int main(int argc, char **argv)
 	// (keep: the driver it failed on saved, the next start tries SDL's other. Only for its start's check
 	// and its textures: a picture failing in play (a suspend and resume, a reset) is the CPU for this
 	// run only; saved, one bad moment on a Deck, Vulkan its only driver, put every later start on the CPU)
+	// The 3D gone to the CPU in play: the scale the player chose for the GPU, 3x with 2x antialiasing, was 0.5 pictures
+	// a second there (vf3-recomp #26's device lost). 1x without antialiasing for this run (cpu_cut, at the pass's end,
+	// said with the notice); the settings saved stay the player's (a graphics setting changed puts them back). Drawing
+	// only: the game's the same
+	bool cpu_cut = false;
 	auto g3_fail = [&](const char *why, bool keep = true) {
 		fprintf(stderr, "the 3D on the GPU: %s: on the CPU for this run%s\n", why, keep ? " (the driver noted for Windows' order)" : "");
+		cpu_cut = true;
 		// (its start's check or its textures: kept for this build, the menu tries again; a picture failing in play, a
 		// sleep or a GPU reset: for this run only)
 		bool other_next = false;   // (Windows: the other driver not tried yet, so the next start tries it by itself)
@@ -2869,9 +2885,11 @@ int main(int argc, char **argv)
 	};
 	// a new render scale or antialiasing: a new picture size
 	auto set_scale = [&](int v, bool by_player = true) {
-		scale = std::clamp(v, 1, MAX_SCALE);
+		v = std::clamp(v, 1, MAX_SCALE);
+		scale_wanted = v;
+		scale = std::min(v, scale_most());
 		if (by_player) {
-			cfg.scale = scale; aa = cfg.aa; cfg_dirty = true;
+			cfg.scale = v; aa = cfg.aa; cfg_dirty = true;
 			load = load_window{ SDL_GetTicksNS() }; gov = gov_window{};   // the player's own choice starts the governor afresh
 			if (cfg.pipelined_at != scale) cfg.pipelined_at = 0;   // (what a run needed at another scale says nothing here)
 			pipelined = pipeline_wanted();            // (and the pipelining, and smooth motion's limit)
@@ -2881,13 +2899,17 @@ int main(int argc, char **argv)
 		m.set_render_scale(scale * aa_fit(scale, aa));
 		m.set_edge_aa(aa == 0);
 		if (!make_texture()) { running = false; return; }
-		if (by_player) { player_scale = scale; player_aa = aa; }
+		if (by_player) { player_scale = v; player_aa = aa; }
 		if (g3.mode == R3D_AUTO && (soft_render || getenv("VF2_AUTO_MEASURE"))) { g3.recheck = true; g3.want_real = false; g3.recheck_why = by_player ? "the player's scale or antialiasing" : "the governor's scale or antialiasing"; }   // (Auto measures no more: the GPU)
 		redraw_shown();   // the picture on show, at the new size
 		log_state(by_player ? "the player's scale or antialiasing" : "the governor's");
 	};
 	// a new shape: a new picture size (the 3D drawn from the next frame on)
 	auto reshape = [&] {
+		// the scale within the width's limit: lowered for a wider shape, back up to the player's (or the
+		// governor's) for a narrower one
+		scale = std::min(scale_wanted, scale_most());
+		if (m.render_scale() != scale * aa_fit(scale, aa)) { m.set_render_scale(scale * aa_fit(scale, aa)); m.set_edge_aa(aa == 0); }
 		if (!make_texture()) { running = false; return; }
 		present_shape();
 		redraw_shown();   // the picture on show, at the new shape (the 3D's lists set up again for the width)
@@ -2986,8 +3008,8 @@ int main(int argc, char **argv)
 		menu_page p{ "Display", "", {} };
 		p.items.push_back({ "Render scale",
 			"How sharp the 3D is. 1x is the original arcade resolution; higher is sharper but needs a faster computer. If yours can't keep up, the game lowers it for you. (F5)",
-			[&] { return std::to_string(scale) + "x"; },
-			[&](int d) { set_scale(std::clamp(scale + d, 1, MAX_SCALE)); } });
+			[&] { return std::to_string(scale) + "x" + (scale < scale_wanted ? " (" + std::to_string(scale_wanted) + "x narrower)" : std::string()); },
+			[&](int d) { set_scale(std::clamp(scale_wanted + d, 1, MAX_SCALE)); } });
 		p.items.push_back({ "Antialiasing",
 			"Smooths jagged edges on the 3D. Low smooths them after drawing and costs little; 2x and 3x draw the picture larger and look cleaner but take a lot more power.",
 			[&] { return aa == 0 ? std::string("Low") : aa_now() == 1 ? std::string(aa > 1 ? "Off (too large here)" : "Off") : std::to_string(aa_now()) + "x"; },
@@ -3204,7 +3226,7 @@ int main(int argc, char **argv)
 				m.set_ring_width(cfg.ring);
 			} });
 		choice("Rounds to win (vs CPU)", "Rounds needed to win a match against the computer.", ga::match_1p, [](int v) { return std::to_string(v); });
-		choice("Rounds to win (vs player)", "Rounds needed to win a match between two players.", ga::match_vs, [](int v) { return std::to_string(v); });
+		choice("Rounds to win (vs player)", "Rounds needed to win a match between two players. Online matches are always first to 3.", ga::match_vs, [](int v) { return std::to_string(v); });
 		choice("Continue", "Off ends the game when you lose to the computer.", ga::continues, [&](int v) { return on_off(v); });
 		choice("Demo sound", "Sound during the demo that plays between games.", ga::advertise_sound, [&](int v) { return on_off(v); });
 		choice("After a versus match", "Winner plays on: the winner carries on against the computer, as on the arcade. Both stop: the game ends for both players.",
@@ -3793,6 +3815,9 @@ int main(int argc, char **argv)
 		finish_async(false);
 		const bool random = !cfg.online.fighter.empty();
 		online.identity = { "vf2", vf2net::online_version(VF2_VERSION) + (random ? vf2net::RANDOM_TAG : ""), vf2net::content_hash(m), "" };   // (the online version, not the release's)
+		// (Random and rooms across Your fighter: the pool, each player's own fighter; and an older build's "+random")
+		online.pool = vf2net::pool_version(vf2net::online_version(VF2_VERSION));
+		online.accepts = { std::string(vf2net::RANDOM_TAG).substr(1) };
 		online_ready = true;
 	};
 	auto online_page = [&] {
@@ -4319,7 +4344,7 @@ int main(int argc, char **argv)
 					if (!timings) SDL_SetWindowTitle(win, title_base);
 				}
 				else if (e.key.scancode == SDL_SCANCODE_F3) reset_game();
-				else if (e.key.scancode == SDL_SCANCODE_F5) set_scale(scale % MAX_SCALE + 1);
+				else if (e.key.scancode == SDL_SCANCODE_F5) set_scale(scale_wanted % MAX_SCALE + 1);
 				else if (e.key.scancode == SDL_SCANCODE_F6) set_shape((aspect_i + 1) % N_ASPECTS);
 				else if (e.key.scancode == SDL_SCANCODE_F11 || fullscreen_key(e.key)) set_fullscreen(!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
 				else if (e.key.scancode == SDL_SCANCODE_F12) {
@@ -4473,7 +4498,7 @@ int main(int argc, char **argv)
 			if (quit_after >= 0 && int64_t(game_frame) >= quit_after) running = false;
 			switch (hk) {
 			case hotkey::menu: open_menu(); break;
-			case hotkey::scale: set_scale(scale % MAX_SCALE + 1); break;   // (as F5: 1x to 6x)
+			case hotkey::scale: set_scale(scale_wanted % MAX_SCALE + 1); break;   // (as F5: 1x to 6x)
 			case hotkey::aspect: set_shape((aspect_i + 1) % N_ASPECTS); break;
 			case hotkey::none: break;
 			}
@@ -4788,6 +4813,15 @@ int main(int argc, char **argv)
 		if (new_shown || (hold_on && !stopped && !menu.is_open())) fps_shown++;
 		// (the 3D on the CPU with the setting not CPU: why, on screen once; not over online play: after it, and one up as
 		// a match is joined is taken down and said again after)
+		if (cpu_cut) {
+			cpu_cut = false;
+			if (scale > 1 || aa != 1) {
+				aa = 1;
+				set_scale(1, false);
+				fprintf(stderr, "the 3D on the CPU: drawn at 1x without antialiasing for this run (the settings kept)\n");
+				if (cpu_why_new) cpu_why += " Drawn at 1x without antialiasing for this run, as the CPU can keep up (Display's settings are kept).";
+			}
+		}
 		if (online.phase() != Online::Phase::off && !cpu_why.empty() && menu.toast_showing()) { menu.toast(""); cpu_why_new = true; }
 		if (cpu_why_new && online.phase() == Online::Phase::off) {
 			cpu_why_new = false;
@@ -5101,8 +5135,8 @@ int main(int argc, char **argv)
 				load.over = load.slow = 0;
 				log_state("the governor's");
 			} else
-			if (govern_cuts && !stepped && gov_calm >= gov_calm_need && (scale < player_scale || aa != player_aa)) {
-				if (scale < player_scale) {
+			if (govern_cuts && !stepped && gov_calm >= gov_calm_need && (scale < std::min(player_scale, scale_most()) || aa != player_aa)) {
+				if (scale < std::min(player_scale, scale_most())) {
 					fprintf(stderr, "%.1f frames a second, %.1f shown, busy %.0f%% of the time: render scale back up to %dx\n", fps, shown_fps, busy * 100, scale + 1);
 					set_scale(scale + 1, false);
 				} else {

@@ -158,7 +158,7 @@ filling the 108dp canvas, the letters inside the 66dp safe zone), which
 
 ## What is still owed
 
-The phone has run it (v0.1.17, on a Xiaomi 14T Pro, Dimensity 9300+, Mali-G720 MC12): `i960 native`
+The phone has run it (v0.1.18, on a Xiaomi 14T Pro, Dimensity 9300+, Mali-G720 MC12): `i960 native`
 (SLJIT's executable memory works), the GPU's 3D exact against the CPU's, the menu (Online included), the
 touches, Back, the immersive landscape window, the sound and the on-screen keyboard all work, and the
 board holds the game's 57.5 frames a second.
