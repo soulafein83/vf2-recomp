@@ -159,10 +159,13 @@ filling the 108dp canvas, the letters inside the 66dp safe zone), which
 
 ## What is still owed
 
-The phone has run it (v0.1.18, on a Xiaomi 14T Pro, Dimensity 9300+, Mali-G720 MC12): `i960 native`
-(SLJIT's executable memory works), the GPU's 3D exact against the CPU's, the menu (Online included), the
-touches, Back, the immersive landscape window, the sound and the on-screen keyboard all work, and the
-board holds the game's 57.5 frames a second.
+The phone has run it (v1.1.3, upstream v0.1.21, on a Xiaomi 14T Pro, Dimensity 9300+, Mali-G720 MC12):
+`i960 native` (SLJIT's executable memory works), the GPU's 3D exact against the CPU's, the menu (Online
+included), the touches, Back, the immersive landscape window, the sound and the on-screen keyboard all
+work, and the board holds the game's 57.5 frames a second. The 13 languages' menus (Polish among them)
+and the Noto fonts for Japanese, Korean and Chinese draw; the v0.1.20 Display, Arcade and Controls pages
+(HUD off, V-Sync, frame limit, Stage select, a second key and pad button) are there; and Online's rooms
+page, Quick match, Create room and Enter code say "no lobby" at once instead of waiting.
 
 Online's **Play by address** was played against a desktop build over the same network: the handshake, a
 match running on both sides (input delay 1, ping ~24 ms, 0 rollbacks, no desync over 8600 frames) and the
