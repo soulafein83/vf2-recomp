@@ -48,7 +48,7 @@ M68000 = third_party/mame/m68000/m68000.cpp third_party/mame/m68000/m68000-decod
 	third_party/mame/m68000/m68000-sdf.cpp third_party/mame/m68000/m68000-sdp.cpp
 HOST = src/host/romset.cpp src/host/input_script.cpp
 # Netplay (src/net, VF3's, kept the same in all three): the game's Online play
-NET_SRC = src/net/session.cpp src/net/link.cpp src/net/room_link.cpp src/net/stun.cpp src/net/http.cpp
+NET_SRC = src/net/session.cpp src/net/link.cpp src/net/room_link.cpp src/net/stun.cpp src/net/http.cpp src/net/watch.cpp
 
 
 # SLJIT (BSD-2): the native code made at start-up. C, built by the C++ compiler's driver (-x c), so
@@ -83,7 +83,7 @@ RML_SRC = $(wildcard third_party/rmlui/Source/Core/*.cpp third_party/rmlui/Sourc
 	third_party/rmlui/Backends/RmlUi_Platform_SDL.cpp third_party/rmlui/Backends/RmlUi_Renderer_SDL.cpp
 RML_CFLAGS = -DRMLUI_STATIC_LIB -DRMLUI_FONT_ENGINE_FREETYPE -DRMLUI_SDL_VERSION_MAJOR=3 -Ithird_party/rmlui/Include -Ithird_party/rmlui/Backends
 $(OBJ)/third_party/rmlui/%.o: CXXFLAGS += $(RML_CFLAGS) $(FT_CFLAGS) $(SDL_CFLAGS) -w
-$(OBJ)/src/host/main.o $(OBJ)/src/host/menu.o $(OBJ)/src/host/online.o $(OBJ)/src/host/sysinfo.o $(OBJ)/src/host/d3d11_map.o: CXXFLAGS += $(SDL_CFLAGS) $(RML_CFLAGS)
+$(OBJ)/src/host/main.o $(OBJ)/src/host/menu.o $(OBJ)/src/host/online.o $(OBJ)/src/host/i18n.o $(OBJ)/tools/langtest.o $(OBJ)/src/host/sysinfo.o $(OBJ)/src/host/d3d11_map.o: CXXFLAGS += $(SDL_CFLAGS) $(RML_CFLAGS)
 $(OBJ)/src/host/main.o $(OBJ)/src/host/online.o: $(OBJ)/version.h
 $(OBJ)/src/host/main.o $(OBJ)/src/host/online.o: CXXFLAGS += -I$(OBJ)
 
@@ -109,7 +109,7 @@ $(OBJ)/src/gpu/gpu3d_sdlgpu.o: CXXFLAGS += $(SDL_CFLAGS)
 $(OBJ)/src/host/main.o: CXXFLAGS += -DVF2_GPU3D_SDL=1
 endif
 
-$(BIN)/vf2: $(call objs,src/host/main.cpp src/host/menu.cpp src/host/online.cpp src/host/vf2_netplay.cpp $(NET_SRC) src/host/sysinfo.cpp src/host/d3d11_map.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(RML_SRC)) $(SLJIT_OBJ) $(GPU3D_OBJ)
+$(BIN)/vf2: $(call objs,src/host/main.cpp src/host/menu.cpp src/host/online.cpp src/host/i18n.cpp src/host/text.cpp src/host/links.cpp src/host/vf2_netplay.cpp $(NET_SRC) src/host/sysinfo.cpp src/host/d3d11_map.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(RML_SRC)) $(SLJIT_OBJ) $(GPU3D_OBJ)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) $(SDL_LIBS) $(FT_LIBS) $(GPU3D_LIBS)
 
@@ -126,17 +126,22 @@ $(BIN)/vf2run: $(call objs,tools/vf2run.cpp src/host/stb_image_impl.cpp $(MACHIN
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
 
 # Netplay (src/net): rollback sessions and their links, nothing of the game's (the same files as VF1's and VF3's)
-NET = src/net/session.cpp src/net/link.cpp src/net/room_link.cpp src/net/stun.cpp src/net/http.cpp
+NET = src/net/session.cpp src/net/link.cpp src/net/room_link.cpp src/net/stun.cpp src/net/http.cpp src/net/watch.cpp
 
 # nettest: the session on a simulated network with a stand-in game (no ROM)
 $(BIN)/nettest: $(call objs,$(NET) tools/nettest.cpp)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $^ -o $@
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
+
+# watchsim: watching a match, simulated (no ROM): the players the same with 0, 1 or 50 watchers, each watcher's game theirs
+$(BIN)/watchsim: $(call objs,$(NET) tools/watchsim.cpp)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
 
 # delaytest: Auto's input delay against simulated pings (full speed at any; raised and lowered as it should)
 $(BIN)/delaytest: $(call objs,$(NET) tools/delaytest.cpp)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $^ -o $@
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
 
 # roomtest: room links against a TURN server on 127.0.0.1:3478 (coturn: tools/roomtest.cpp)
 $(BIN)/roomtest: $(call objs,$(NET) tools/roomtest.cpp)
@@ -146,7 +151,27 @@ $(BIN)/roomtest: $(call objs,$(NET) tools/roomtest.cpp)
 # netfuzz: the session against a peer who sends anything, with AddressSanitizer and UBSan (its own objects)
 $(BIN)/netfuzz: $(NET) tools/netfuzz.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer $^ -o $@
+	$(CXX) -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer $^ -o $@ $(LDLIBS)
+
+# wsfuzz: the WebSocket frame reader against anything a server could send, with AddressSanitizer and UBSan
+$(BIN)/wsfuzz: src/net/http.cpp tools/wsfuzz.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer $^ -o $@ -lpthread
+
+# snapfuzz: a watcher's snapshot loading against a hostile host's (spoilt real snapshots: vf2net --watch-snap --snap-out
+# DIR), with AddressSanitizer and UBSan, its own objects (make snapfuzz: build/asan/bin/snapfuzz)
+ASAN_FLAGS = -std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-function
+snapfuzz:
+	CXXFLAGS="$(ASAN_FLAGS)" $(MAKE) OBJ=build/asan/obj BIN=build/asan/bin build/asan/bin/snapfuzz
+.PHONY: snapfuzz
+# (the sound board's 68000, MAME's generated code, unchanged: without the sanitizers there, a gigabyte less and the same
+# checks everywhere else)
+ifeq ($(OBJ),build/asan/obj)
+$(OBJ)/third_party/mame/m68000/%.o: CXXFLAGS = -std=c++20 -O1 -g0 -Isrc/core/shim_include
+endif
+$(BIN)/snapfuzz: $(call objs,tools/snapfuzz.cpp src/host/vf2_netplay.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(NET)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) -lpthread
 
 # The rollback soak test (tools/vf2soak.cpp): two boards, one rolled back every frame, byte for byte the same
 $(BIN)/vf2soak: $(call objs,tools/vf2soak.cpp src/host/vf2_netplay.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(NET)) $(SLJIT_OBJ)
@@ -175,9 +200,16 @@ $(BIN)/vf2soundonly: $(call objs,tools/vf2soundonly.cpp $(MACHINE) $(HOST) $(COR
 
 # menutest: the Online pages as pictures, no ROM (a made-up one builds the board; SDL_VIDEO_DRIVER=offscreen)
 $(OBJ)/tools/menutest.o: CXXFLAGS += $(SDL_CFLAGS) $(RML_CFLAGS)
-$(BIN)/menutest: $(call objs,tools/menutest.cpp src/host/menu.cpp src/host/online.cpp src/host/vf2_netplay.cpp $(NET_SRC) $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(RML_SRC)) $(SLJIT_OBJ)
+$(BIN)/menutest: $(call objs,tools/menutest.cpp src/host/menu.cpp src/host/online.cpp src/host/i18n.cpp src/host/text.cpp src/host/links.cpp src/host/vf2_netplay.cpp $(NET_SRC) $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(RML_SRC)) $(SLJIT_OBJ)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) $(SDL_LIBS) $(FT_LIBS)
+
+# langtest: the strings' tables (src/host/lang): every ID in every language once, the same {places} as the English, each
+# language's letters in the menus' fonts, the settings' language codes; no ROM, no window
+$(BIN)/langtest: $(call objs,src/host/i18n.cpp src/host/text.cpp tools/langtest.cpp)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(SDL_LIBS) $(FT_LIBS)
+$(OBJ)/tools/langtest.o: CXXFLAGS += $(FT_CFLAGS)
 
 clean:
 	rm -rf $(OBJ) $(BIN)
@@ -281,3 +313,8 @@ $(BIN)/audiocheck: $(call objs,tools/audiocheck.cpp)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS) $(SDL_LIBS)
 .PHONY: audiocheck
 audiocheck: $(BIN)/audiocheck
+
+# vf2watchsound: a late watcher's match sound after its catch-up against a from-the-start watcher's (join points swept)
+$(BIN)/vf2watchsound: $(call objs,tools/vf2watchsound.cpp src/host/vf2_netplay.cpp src/host/stb_image_impl.cpp $(MACHINE) $(HOST) $(CORE) $(GEN_NONE) $(M68000) $(NET)) $(SLJIT_OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)

@@ -67,7 +67,7 @@ add_custom_target(vf2_version ALL
 
 # ------------------------------------------------------------- the game's code
 set(VF2_APP
-    src/host/main.cpp src/host/menu.cpp src/host/online.cpp src/host/vf2_netplay.cpp
+    src/host/main.cpp src/host/menu.cpp src/host/online.cpp src/host/i18n.cpp src/host/text.cpp src/host/links.cpp src/host/vf2_netplay.cpp
     src/host/sysinfo.cpp
     src/host/d3d11_map.cpp src/host/stb_image_impl.cpp
     src/rec/gen_none.cpp
@@ -81,7 +81,7 @@ set(VF2_HOST
 # Netplay (src/net, VF3's, kept the same in all three): the game's Online play
 set(VF2_NET
     src/net/session.cpp src/net/link.cpp src/net/room_link.cpp
-    src/net/stun.cpp src/net/http.cpp)
+    src/net/stun.cpp src/net/http.cpp src/net/watch.cpp)
 set(VF2_CORE
     third_party/mame/i960/i960.cpp third_party/mame/i960/i960dis.cpp
     src/core/mame_shim.cpp src/core/mb86233.cpp src/core/i960_device.cpp

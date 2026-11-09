@@ -45,7 +45,7 @@ public:
 	static constexpr uint64_t VBLANK_CYCLES = CYCLES_PER_LINE * (LINES - VBLANK_LINE);
 	static constexpr int WIDTH = 496, HEIGHT = 384;
 
-	explicit model2a(romset::result &&roms);
+	explicit model2a(romset::result &&roms, bool recompile = true);   // (recompile false: a sound board alone, set_sound_only, never runs the i960)
 	~model2a() override;
 
 	void reset();
@@ -66,6 +66,7 @@ public:
 	// Between frames only (after run_frame()).
 	void save_state(std::vector<uint8_t> &out, std::vector<m2::StateSection> *sections = nullptr);
 	bool load_state(const uint8_t *p, size_t n);
+	size_t fixed_state_size() const;   // (the memories' part, and its header: a state's least)
 	static constexpr uint32_t STATE_MAGIC = 0x53324656, STATE_VERSION = 1;   // "VF2S"
 	// The state's first bytes are for this board's saves alone (which board, since which reset, which save): two
 	// boards in the same state have the same bytes after them, and only those are compared or hashed
@@ -316,6 +317,10 @@ public:
 	// The stage backdrop above 1x: softened and smoothly enlarged, or its pixels as blocks (the
 	// arcade's, enlarged). Only in a fight (wide_frame()); the rest of the 2D stays sharp.
 	void set_backdrop_filter(bool smooth) { m_backdrop_smooth = smooth; }
+	// Display > HUD Off: in a fight (game_mode() 9) the 2D over the 3D of tile maps 0 and 1, the HUD's (the energy bars,
+	// the timer, the names, the rounds won, the round calls' text), isn't drawn, nor the names put in it; the backdrop's
+	// maps (2, 3) are, their tiles over the 3D too. The picture only: what's drawn never reaches the board's state
+	void set_hud_hidden(bool hidden) { m_hud_hidden = hidden; }
 	bool backdrop_filter() const { return m_backdrop_smooth; }
 	// The attract's SEGA logo is up (it sets bit 16 of the flags at 0x500068 every frame it
 	// runs; clear again once the attract moves on): the first time, at about frame 728 from
@@ -338,6 +343,13 @@ public:
 	// profile. Takes effect as a cursor next moves onto him: set before the game starts (the
 	// menu restarts it). False for another number, or if the program isn't the one known.
 	bool set_secret_character(int fighter);
+	// Arcade settings > Debug mode: the arcade's own debug mode, as its secret code gives it (hold Service, then P1 Left, P, K,
+	// Right, Right, Down, P, Up, K, K: bit 14 of 0x508000, which lets the game read all of the board's switches) with
+	// switch 1 on (bit 0 of port G, which turns it on: the CPU load, the polygon count and the hits on the screen; P2
+	// Start with P2 Guard held stops the game for its menu, held P2 Start shows it, P1's stick moves in it). Set before
+	// each frame while on; off, nothing (the game as ever). Offline only: never on an online match's board.
+	void set_debug_mode(bool on) { m_debug_mode = on; }
+	bool debug_mode() const { return m_debug_mode; }
 	// Cheats' random fighters (random_fighter.cpp). Each player's fighter: "" the select as ever, "*" a random
 	// fighter, a new one each game, or a name's (as on its energy bar: a seed's, the same fighter on any machine).
 	// Anything but "" is picked for that player at the select: three of the cast made one, its head, body and limbs
@@ -401,6 +413,7 @@ public:
 
 	// Inputs, active low as on the cabinet (IN0: coins, service, start; IN1/IN2: players)
 	u8 m_in0 = 0xff, m_in1 = 0xff, m_in2 = 0xff, m_sw = 0xff;
+	bool m_debug_mode = false;   // (set_debug_mode: not in the saved state, a setting)
 
 	// The sound board's output since the host last took it: stereo pairs at SOUND_RATE (the
 	// SCSP's 22.5792 MHz / 512). Empty while the board is held (set_sound(false)).
@@ -461,6 +474,7 @@ private:
 	// written since (each page's save number when last written). The RAMs the recompiled code writes directly,
 	// and buffer RAM (the TGP's too), are copied whole.
 	template <class IO> void state(IO &io);
+	bool state_sane() const;
 	// (Cheats' random fighters in a save state, while they're on: the ROM's bytes they change as a match goes, and what
 	// they know of them; a load puts back the fighters the state had, made again if they're others now)
 	void random_state(m2::StateWriter &io);
@@ -473,7 +487,6 @@ private:
 	void touch(int r, size_t byte) { m_page_gen[r][byte / PAGE] = m_snap_gen; }
 	u8 *paged_base(int r);   // (where each is now: swap_2d swaps the vectors)
 	size_t paged_bytes(int r) const;
-	size_t fixed_state_size() const;
 	void setup_pages();
 
 	romset::result m_roms;
@@ -629,6 +642,7 @@ private:
 	void bd_pixels(int mode, double dh, double dv, int &dx, int &dy) const;
 	void draw_2d(bool polygons, bool parts);
 	bool m_2d_wide = false, m_2d_filter = false;   // what the last draw_2d drew
+	bool m_hud_hidden = false;   // (set_hud_hidden: the host's, read when a picture's 2D is drawn)
 	uint64_t m_2d_version = 0;
 	uint64_t m_2d_key[5] = { ~0ull };              // smooth motion: the frame, scale, width, filter and parts it was drawn for
 	void compose(u32 *out, size_t stride, const bitmap_rgb32 *layer3d, int x0, int x1, bool smooth, u32 pen0, int bdx = 0, int bdy = 0);

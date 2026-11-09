@@ -15,8 +15,9 @@ This file is the part a player needs: build it, install it, get a ROM in.
 - Your own `vf2.zip`.
 - One permission, `INTERNET`, for Online's **Play by address** (UDP sockets). It is Android's
   normal permission (no prompt). The app asks for nothing else and keeps everything in its own
-  folders. The lobby and its room codes need libcurl, which Android doesn't ship, so this build
-  has no lobby address in it: Online plays by address (the same network, or a VPN).
+  folders. The lobby — rooms, room codes, Quick match and watching — needs libcurl, which Android
+  doesn't ship, so this build has no lobby address in it: Online plays by address (the same network,
+  or a VPN).
 
 ## Build
 
@@ -141,10 +142,10 @@ network, or over a VPN, with no service in between; one side hosts, the other jo
 address and port. Both sides run the same game (the ROM's hash is checked) and the host's Rounds to
 win (vs player), 3 by default.
 
-The lobby — Online > Random, room codes, and the count on its card — needs libcurl, which Android
-doesn't ship, so this build carries no lobby address and those pages say so. Play by address is the
-way to play. A lobby can be built in with `.lobby-url` (one line, kept out of git) or `VF_LOBBY_URL`
-at build time, but it still needs libcurl at run time to reach it.
+The lobby — Online's rooms, room codes, Quick match, the count on its card and watching — needs
+libcurl, which Android doesn't ship, so this build carries no lobby address and those pages say so.
+Play by address is the way to play. A lobby can be built in with `.lobby-url` (one line, kept out of
+git) or `VF_LOBBY_URL` at build time, but it still needs libcurl at run time to reach it.
 
 Online's settings (your name, delay, max ping, the match-found chime, Your fighter's random or seed
 fighter) are in the game's menu and kept in `settings.ini` like the rest.
@@ -172,8 +173,8 @@ What is left:
 - The GPU's own 3D runs under the game's frame rate on a Dimensity 9300+, so **2x at full speed is the
   CPU 3D's**; at 5x/6x a 15-18 ms texture upload appears. During an online match the phone still holds
   57.5 frames/s at 4x.
-- The lobby and room codes need libcurl, which Android doesn't ship: this build carries no lobby address
-  (see **Online** above).
+- The lobby — rooms, room codes, Quick match and watching — needs libcurl, which Android doesn't ship:
+  this build carries no lobby address (see **Online** above).
 - The governor still walks the render scale down from 2x to 1x while the frames and pictures are whole:
   it costs sharpness and buys nothing.
 - Player 2 has no on-screen pad (a second gamepad or a keyboard plays them).

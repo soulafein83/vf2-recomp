@@ -148,7 +148,7 @@ struct model2a::tgp_bus : mb86233_bus
 		offs_t index = ie <= 0x17 ? (im | 0x800000) >> ie : 0;
 		if (index == 0x4000)
 			index = 0x3fff;
-		u32 result = tables[index | 0x4000];
+		u32 result = tables[(index | 0x4000) & 0xffff];   // (the tables' 64K words: a far index (ie < 9, a program's own, as a snapshot's can be) read past them)
 		if (s0 ^ s1 ^ s2)
 			result >>= 16;
 		if (s2)
@@ -163,7 +163,7 @@ mb86233_device &model2a::tgp() { return m_tgp->cpu; }
 
 // ---------------------------------------------------------------------------------------------
 
-model2a::model2a(romset::result &&roms)
+model2a::model2a(romset::result &&roms, bool recompile)
 	: m_roms(std::move(roms)), m_rom(m_roms.regions[romset::MAINCPU]), m_data(m_roms.regions[romset::MAIN_DATA]),
 	  m_cpu(*this)
 {
@@ -202,7 +202,7 @@ model2a::model2a(romset::result &&roms)
 	m_sched[CPU_Z80].set_rate(32000000 / 4);
 	// the i960's program recompiled to native code now (src/rec), unless VF2_INTERP is set (MAME's
 	// interpreter: the reference, cycle for cycle the same)
-	if (!getenv("VF2_INTERP")) use_native();
+	if (recompile && !getenv("VF2_INTERP")) use_native();
 }
 
 // device_execute_interface::clock_changed
@@ -677,11 +677,11 @@ template <class IO> void attos(IO &io, unsigned __int128 &t)   // (the scheduler
 	t = (unsigned __int128)hi << 64 | lo;
 }
 
-template <class IO, class E> void enum32(IO &io, E &e)
+template <class IO, class E> void enum32(IO &io, E &e, int32_t last)   // (one of 0 to last: else the state's refused)
 {
 	int32_t v = int32_t(e);
 	io.pod(v);
-	e = E(v);
+	if (io.check(v >= 0 && v <= last)) e = E(v);
 }
 
 } // namespace
@@ -777,13 +777,13 @@ template <class IO> void model2a::state(IO &io)
 	io.section("eeprom");
 	eeprom93c46 &e = m_eeprom;
 	io.pod(e.cells); io.pod(e.cs); io.pod(e.clk); io.pod(e.di);
-	enum32(io, e.state);
+	enum32(io, e.state, eeprom93c46::WAIT_FOR_COMPLETION);
 	io.pod(e.locked); io.pod(e.bits); io.pod(e.cmd_addr); io.pod(e.shift); io.pod(e.address);
-	enum32(io, e.command);
+	enum32(io, e.command, eeprom93c46::ERASEALL);
 	io.pod(e.completion); io.pod(e.cs_rise);
 	io.section("uart");
 	uart8251 &u = m_uart;
-	enum32(io, u.flags);
+	enum32(io, u.flags, uart8251::NEXT_COMMAND);
 	io.pod(u.status); io.pod(u.command); io.pod(u.mode); io.pod(u.tx_data); io.pod(u.br_factor); io.pod(u.delayed_tx_en);
 	io.pod(u.tx_bits_left); io.pod(u.tx_shift); io.pod(u.txc_count); io.pod(u.txc);
 	io.pod(m_link_fast); io.pod(m_link_mode_edge);
@@ -795,6 +795,43 @@ template <class IO> void model2a::state(IO &io)
 		random_state(io);
 	}
 	io.section("end");
+	if constexpr (IO::loading) io.check(state_sane());
+}
+
+// A loaded state's values that are used as an index, a count, a divisor, a shift or a time to run to: as the board
+// makes them (a state from another process, a watcher's snapshot from a match's host, may hold anything). The board's
+// own states always are; the checks are a few dozen comparisons a load
+bool model2a::state_sane() const
+{
+	bool seen[N_CPUS] = {};
+	for (const int c : m_order) {
+		if (c < 0 || c >= N_CPUS || seen[c]) return false;
+		seen[c] = true;
+	}
+	for (const std::vector<int> &q : m_line_queue) {
+		if (q.size() > 64) return false;
+		for (const int st : q) if (st != CLEAR_LINE && st != ASSERT_LINE) return false;
+	}
+	for (const gen_fifo *f : { &m_fifo_in, &m_fifo_out })
+		if (f->values.size() > 8 || f->extra.size() > 1024 || (!f->extra.empty() && f->values.size() < 8)) return false;
+	// the times: the scheduler runs each CPU up to the first timer, so none far from now (a frame is 17 ms; the
+	// longest a timer waits, the SCSP's, under a second), and the frame's own timer always set
+	const atime most = atime(8) * AS_PER_SEC;
+	if (m_base > (atime(1) << 100)) return false;
+	for (const timer &t : m_timer)   // (a period a one-shot's 0, else the SCSP's or the sound update's: never under a microsecond,
+		// or the timer fires for ever without the CPUs running; found by fuzzing)
+		if (t.enabled && (t.expire > m_base + most || t.period > most || (t.period && t.period < AS_PER_SEC / 1000000))) return false;
+	if (!m_timer[T_VBLANK_START].enabled) return false;
+	for (const cpu_sched &c : m_sched)   // (and each CPU's time its whole cycles, as it only ever moves: else a slice short of
+		// a cycle can't be run and the scheduler goes round for ever; found by fuzzing)
+		if (c.local > m_base + most || c.local + most < m_base || c.local != atime(c.cycles) * c.period) return false;
+	const eeprom93c46 &e = m_eeprom;
+	if (e.address >= std::size(e.cells) || (e.cs | e.clk | e.di) & ~1 || e.bits < 0 || e.bits > 0x10000) return false;
+	const uart8251 &u = m_uart;
+	if ((u.br_factor != 1 && u.br_factor != 16 && u.br_factor != 64) || u.txc_count < 0 || u.txc_count >= u.br_factor ||
+	    u.tx_bits_left < 0 || u.tx_bits_left > 10 || (u.txc & ~1))
+		return false;
+	return true;
 }
 
 void model2a::save_state(std::vector<uint8_t> &out, std::vector<m2::StateSection> *sections)
@@ -1194,10 +1231,14 @@ void model2a::run_frame()
 	keep_2d();
 	// (Cheats' random fighters at the select: a random player's controls let go, its cursor and pick pressed for it
 	// (random_fighter.cpp's select_inputs), this frame's only: the inputs as given after it)
-	const u8 in_were[2] = { m_in1, m_in2 };
+	const u8 in_were[2] = { m_in1, m_in2 }, sw_was = m_sw;
 	if (m_random) random_select_inputs();
+	if (m_debug_mode) {   // (Arcade settings > Debug mode: the secret code's flag, and switch 1 on, this frame's only)
+		write_dword(0x508000, read_dword(0x508000) | 0x4000);
+		m_sw = u8(m_sw & ~1);
+	}
 	while (m_frame_number == f) timeslice();
-	m_in1 = in_were[0]; m_in2 = in_were[1];
+	m_in1 = in_were[0]; m_in2 = in_were[1]; m_sw = sw_was;
 	take_audio();
 	m_scroll_hist[f % SCROLL_HIST] = { int64_t(f), m_tiles.tile_r(0x5002), m_tiles.tile_r(0x5006) };   // (smooth motion's backdrop)
 	record_scroll_input(f);
@@ -2268,6 +2309,7 @@ void model2a::draw_2d(bool polygons, bool parts)
 	// (2 and 3) carry on to the sides, from the stage's panorama where it's known
 	const segas24_tile::panorama *pan = wide ? find_panorama() : nullptr;
 	// the three bitmaps at once, each on a thread (the tiles' planes are only read)
+	const bool hud_off = m_hud_hidden && game_mode() == 9;   // (Display > HUD Off, in a fight: maps 0 and 1 not drawn over the 3D)
 	m_tiles.m_ox = e;
 	parallel_tasks(3, [&](int task) {
 		const rectangle all(0, w - 1, 0, HEIGHT - 1);
@@ -2283,7 +2325,7 @@ void model2a::draw_2d(bool polygons, bool parts)
 				m_tiles.draw(m_sys24_mid, clip, layer << 1, 0, 0);
 		} else {
 			m_sys24_top.fill(0, all);
-			for (int layer = 3; layer >= 0; layer--) {
+			for (int layer = 3; layer >= (hud_off ? 2 : 0); layer--) {
 				m_tiles.draw(m_sys24_top, clip, (layer << 1) | 1, 0, 0);
 				if (wide && layer >= 2) m_tiles.draw_sides(m_sys24_top, (layer << 1) | 1, 0, e, pan);
 			}
@@ -2294,7 +2336,7 @@ void model2a::draw_2d(bool polygons, bool parts)
 		std::lock_guard<std::mutex> lk(m_hud_mx);
 		const bool online = !m_hud_names[0].empty() || !m_hud_names[1].empty();
 		const std::string *names = online ? m_hud_names : m_random_hud;
-		if (!names[0].empty() || !names[1].empty()) {
+		if (!hud_off && (!names[0].empty() || !names[1].empty())) {
 			const m2hud::Flag *fl[2] = { &m_hud_flags[0], &m_hud_flags[1] };
 			if (!m2hud::draw(m_tiles, m_sys24_top, e, names, online ? fl : nullptr, m_hud_flag_at))
 				for (auto &a : m_hud_flag_at) a[0] = a[1] = -1;

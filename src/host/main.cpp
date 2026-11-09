@@ -134,6 +134,10 @@
 //   VF2_MENU_KEYS=k,...  presses these keys (esc, up, down, left, right, enter, or SDL key names)
 //                        6 passes of the loop apart from pass 30: for the menu, which stops the
 //                        game's frames
+//   VF2_HOST_ROOM=1      hosts a room code's match at pass 60 (the code in log.txt), as Online > Create room
+//   VF2_JOIN_CODE=XXXXXX joins that room at pass 60 (VF_LOBBY: another lobby); VF2_RANDOM=1 Quick match
+//   VF2_WATCH_CODE=XXXXXX watches that match at pass 60, as Online > a room > Watch
+//   VF2_HOST_PUBLIC=1    VF2_HOST_ROOM's room listed in Rooms (its matches may be watched by its code either way)
 //   VF2_SHOT_AT=n,...    the window as drawn at these passes, to build/host_window_at_N.png
 //   VF2_TEST_SAVES=1     a test run (VF2_QUIT_AFTER) saves the NVRAM and settings.ini all the same
 //   VF2_KO=P@a[-b]       knocks player P out in every round from game frame a (to b), as vf2run's
@@ -159,6 +163,8 @@
 //                        the loop: b3@200 its button 3, h1@260 its hat (1 up, 2 right, 4 down, 8 left), +0@300 or
 //                        -1@300 an axis to one end (each 8 passes), q@900 quit (a run that saves), p@100 plugged
 //                        in then (not at the start); "1": no presses. Player 1's controls logged as they change
+//   VF2_TEST_RAM_LOG=f   the game's work RAM hashed every 30 game frames to f (a display setting changes no frame)
+//   VF2_TEST_CHIME_WAV=f the match found chime's sound (the game's coin, made at the start) to f, a .wav
 #include "version.h"      // VF2_VERSION, VF2_DATE (made by the Makefile from git)
 #include "../machine/model2a.h"
 #include "../machine/parallel.h"
@@ -172,7 +178,11 @@
 #include "menu.h"
 #include "crt_colours.h"
 #include "online.h"
+#include "links.h"
+#include "text.h"
 #include "chime.h"
+#include "coin_sound.h"
+#include <future>
 #include "flags.h"
 #include "controls.h"
 #include "touch_controls.h"
@@ -197,9 +207,10 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
-#include <cerrno>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <map>
 #include <thread>
@@ -452,6 +463,28 @@ const key_bind SYS_KEYS[] = {
 // said about it, and Start simply starts.
 bool g_pc_mode = true;
 bool g_match_board = false;   // (an online match's board: the host's settings and the match's program, none of this player's)
+// Arcade settings > Stage select (issue #33): a versus's first fight after Start (a challenger in at the select, or
+// both players in from Start) on the stage chosen, the game's own order on from it, as online's random stages: 1-9
+// the versus order's stages after its first (0, the game's own), 10 Dural's. Its stage comes from the game's count of
+// fights (vf2net::FIGHTS), which the select's first frame loads the stage's textures from (mode 7: online's -38 note),
+// so the count and the stage (vf2net::STAGE) are set the frame before (mode 6), the game's first fight still to come:
+// the count 0, no one has won (vf2net::STREAK), the 1P ladder's fight number (LADDER, from 1) 1. A 1P game's fights
+// don't come from the count (the CPU's order, its stages theirs): there it's put back to 0 as the fight starts, the
+// game as ever (a challenger later in it on the game's own stage). Offline only: never on an online match's board.
+static void stage_select(model2a &m, int stage)
+{
+	constexpr uint32_t LADDER = 0x54;
+	auto &ram = const_cast<std::vector<u8> &>(m.workram());
+	static bool set = false;   // (the count set, for this fight: the game's own again in a 1P game)
+	if (set && m.game_mode() == 9) {   // (the fight: a versus, or 1P)
+		if (ram[vf2net::VERSUS] == 0 && ram[vf2net::FIGHTS] == u8(stage)) ram[vf2net::FIGHTS] = 0;
+		set = false;
+	}
+	if (stage <= 0 || m.game_mode() != 6 || ram[vf2net::FIGHTS] != 0 || ram[vf2net::STREAK] != 0 || ram[LADDER] != 1) return;
+	ram[vf2net::FIGHTS] = ram[vf2net::STAGE] = u8(stage);
+	set = true;
+	fprintf(stderr, "Arcade settings > Stage select: a versus from this select on stage %d%s\n", stage + 1, stage == vf2net::STAGES ? " (Dural's)" : "");
+}
 
 struct pad_state
 {
@@ -484,6 +517,7 @@ hotkey read_inputs(model2a &m, SDL_Gamepad *pads[2], pad_state ps[2], const play
 	for (const auto &k : SYS_KEYS)
 		if (ks[k.key]) in[k.port] |= k.bit;
 	auto key = [&](SDL_Scancode k) { return k != SDL_SCANCODE_UNKNOWN && ks[k]; };
+	auto keys = [&](const player_controls &c, int a) { return key(c.key[a]) || key(c.key2[a]); };   // (either of a control's keys)
 	hotkey hk = hotkey::none;
 	static bool key_start_was[2], key_coin_was[2], pad_coin_was[2], key_menu_was[2];
 	for (int p = 0; p < 2; p++) {
@@ -504,12 +538,12 @@ hotkey read_inputs(model2a &m, SDL_Gamepad *pads[2], pad_state ps[2], const play
 			if (overlay->take_menu()) hk = hotkey::menu;
 		}
 		// a key set as Menu opens it too (Esc always does)
-		const bool kmenu = key(ctl[p].key[C_MENU]);
+		const bool kmenu = keys(ctl[p], C_MENU);
 		if (kmenu && !key_menu_was[p]) hk = hotkey::menu;
 		key_menu_was[p] = kmenu;
 		for (int a = 0; a < C_START; a++)
-			if (key(ctl[p].key[a])) in[1 + p] |= BITS[a];
-		const bool kstart = key(ctl[p].key[C_START]);
+			if (keys(ctl[p], a)) in[1 + p] |= BITS[a];
+		const bool kstart = keys(ctl[p], C_START);
 		if (kstart && !key_start_was[p]) press_start();
 		key_start_was[p] = kstart;
 		// Start held reaches the game too, the arcade way, as the cabinet's button: a fighter chosen with
@@ -518,7 +552,7 @@ hotkey read_inputs(model2a &m, SDL_Gamepad *pads[2], pad_state ps[2], const play
 		bool start_held = kstart, start_now = kstart;
 		// Coin (a cabinet's coin slot, bound in the menu): a coin for this player, the arcade way
 		// (the PC way is free play: the game takes no coins)
-		const bool kcoin = key(ctl[p].key[C_COIN]);
+		const bool kcoin = keys(ctl[p], C_COIN);
 		if (kcoin && !key_coin_was[p] && !g_pc_mode) st.coin_frames = 6;
 		key_coin_was[p] = kcoin;
 
@@ -529,13 +563,13 @@ hotkey read_inputs(model2a &m, SDL_Gamepad *pads[2], pad_state ps[2], const play
 			const int lx = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX), ly = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY);
 			const int dead = 12000;
 			const bool back = btn(SDL_GAMEPAD_BUTTON_BACK);
-			const bool start = player_controls::pad_down(g, ctl[p].pad[C_START]);
+			const bool start = ctl[p].pad_either(g, C_START);
 			// Coin and Menu on View are its tap (below), so View + LB and the like stay hotkeys
 			const int coin_code = ctl[p].pad[C_COIN], menu_code = ctl[p].pad[C_MENU];
-			const bool pcoin = coin_code != SDL_GAMEPAD_BUTTON_BACK && player_controls::pad_down(g, coin_code);
+			const bool pcoin = (coin_code != SDL_GAMEPAD_BUTTON_BACK && player_controls::pad_down(g, coin_code)) || player_controls::pad_down(g, ctl[p].pad2[C_COIN]);
 			if (pcoin && !pad_coin_was[p] && !g_pc_mode) st.coin_frames = 6;
 			pad_coin_was[p] = pcoin;
-			const bool pmenu = menu_code != SDL_GAMEPAD_BUTTON_BACK && player_controls::pad_down(g, menu_code);
+			const bool pmenu = (menu_code != SDL_GAMEPAD_BUTTON_BACK && player_controls::pad_down(g, menu_code)) || player_controls::pad_down(g, ctl[p].pad2[C_MENU]);
 			if (pmenu && !st.menu_was && !back) hk = hotkey::menu;   // (View held: LB and RB are its hotkeys)
 			st.menu_was = pmenu;
 			// L3 + R3 and the touchpad click (a PlayStation pad's) always open the menu as well, so a
@@ -544,7 +578,7 @@ hotkey read_inputs(model2a &m, SDL_Gamepad *pads[2], pad_state ps[2], const play
 			if (sticks && !st.sticks_was) hk = hotkey::menu;
 			st.sticks_was = sticks;
 			bool touch_bound = false;
-			for (int a = C_GUARD; a < C_COUNT; a++) touch_bound |= ctl[p].pad[a] == SDL_GAMEPAD_BUTTON_TOUCHPAD;
+			for (int a = C_GUARD; a < C_COUNT; a++) touch_bound |= ctl[p].pad[a] == SDL_GAMEPAD_BUTTON_TOUCHPAD || ctl[p].pad2[a] == SDL_GAMEPAD_BUTTON_TOUCHPAD;
 			const bool touch = !touch_bound && btn(SDL_GAMEPAD_BUTTON_TOUCHPAD);
 			if (touch && !st.touch_was) hk = hotkey::menu;
 			st.touch_was = touch;
@@ -563,7 +597,7 @@ hotkey read_inputs(model2a &m, SDL_Gamepad *pads[2], pad_state ps[2], const play
 				lb_was[p] = lb; rb_was[p] = rb;
 			} else {
 				for (int a = C_GUARD; a < C_START; a++)
-					if (player_controls::pad_down(g, ctl[p].pad[a])) b |= BITS[a];   // (not Start nor Coin)
+					if (ctl[p].pad_either(g, a)) b |= BITS[a];   // (not Start nor Coin)
 				if (start && !st.start_was) press_start();
 				start_held |= start;
 				start_now |= start;
@@ -830,14 +864,18 @@ struct settings
 	// Display's own two rows for the gpu renderer: vsync, and how many frames it may keep in flight
 	// (see apply_display_settings, where the second one is explained)
 	int vsync = 1;
+	bool hud = true;     // Display > HUD: the 2D over a fight (energy bars, timer, names...) drawn; off: the 3D and the backdrop only
+	int frame_limit = -1;   // Display > Frame limit: the pictures a second at most, 30 60 120 144; 0 none, -1 the screen's refresh (as before with vsync)
 	int on_screen = 1;   // the on-screen controls (a touch screen): 0 off, 1 while the player has no pad, 2 always
+	int stage = -1;   // Arcade settings > Stage select: a versus's first stage after Start (1-9 the versus order's, 10 Dural's; 0, its first, the game's own), -1 the game's own
 	int secret = 0;   // Cheats > Secret character: the fighter in Akira's place (model2a::set_secret_character), 0 none
 	std::string random_player[2];   // Cheats: each player's fighter: "" the select as ever, "*" a random one each game, or a name's (model2a::set_random_player)
 	std::string random_named[2];    // (each player's last name typed: Left / Right come back to it)
 	bool random_cpu = false;        // Cheats: Random opponents, every computer opponent a random fighter
-	// settings.ini's version: 2 from v0.1.2 (none before), 3 from the phone's fullscreen (this
-	// fork) or from the GPU's failures forgotten once (upstream v0.1.15), 4 the merged build. Its
-	// upgrades, once, as it's read:
+	bool debug_mode = false;        // Arcade settings: Debug mode, the arcade's own (model2a::set_debug_mode), offline only
+	// settings.ini's version: 2 from v0.1.2 (none before), 3 from the GPU's failures forgotten once
+	// (v0.1.15) or the phone's fullscreen, 4 from Rounds to win (vs player) 3 (v0.1.17), 5 the same
+	// once more, for everyone (v0.1.18). Its upgrades, once, as it's read:
 	//   2: the old default music volume, 20, to the new one, 50 (the music's stereo reverb mended:
 	//      at 20 it's now too quiet); a 20 chosen later is kept (the file then says version 2)
 	//   3: on a phone, fullscreen = 0 (the old default: the menu couldn't open on Android before
@@ -863,6 +901,7 @@ struct settings
 	std::string roms_folder;   // where the player keeps vf2.zip (roms_folder = ...: kept as written)
 	int arcade_coin = -2;   // the arcade way's coin setting, kept while the PC way has FREE PLAY in its place (-1: none to give back; -2: none kept yet)   // the render scale this machine needed pipelining at (the governor's, kept: a start there starts pipelined)
 	bool log = true;   // log.txt written (Game > Log file: read before the log's opened, so from the next start)
+	std::string language = "auto";   // Game > Language: auto (the system's), or a language's code (tr::choice_key)
 	OnlineSettings online;   // the Online page's
 	// A phone has no window to speak of: start immersive (Display > Fullscreen turns it off, and
 	// settings.ini keeps that choice). Elsewhere, a window the player can move and resize.
@@ -882,6 +921,16 @@ struct settings
 	int frames_in_flight = 1;   // (SDL's renderer's own: the shortest delay to the screen)
 	int perf_hints = 0;   // (Android's performance hints: nothing here)
 #endif
+	int window_scale = 0;   // Display > Window size: the window k times the arcade's 384 lines high (4:3 and Fit 512 x k
+	                        // wide, wider shapes theirs), each arcade line k of the screen's; 0 Free (as the player sizes it)
+	// The window's place and size as last left in a window (VF3's issue #21), in the window's own units (points on a
+	// Mac, as SDL_CreateWindow takes them); window_w 0: none yet. Maximised: the size under it kept, maximised again
+	int window_w = 0, window_h = 0, window_x = 0, window_y = 0;
+	bool window_max = false;
+	// Fullscreen as a borderless window over the screen and a line past it (VF3's issue #7: AMD's driver on Windows
+	// froze in its own, exclusive fullscreen): the way on Windows unless fullscreen_exclusive = 1 (Display > Fullscreen
+	// mode); elsewhere the system's own fullscreen (a Mac's Spaces, the Deck's gamescope) unless fullscreen_window = 1
+	bool fs_window = false, fs_exclusive = false;
 	player_controls ctl[2] = { player_controls::defaults(0), player_controls::defaults(1) };
 	std::vector<std::string> pad_mappings;   // pad_mapping lines: SDL mappings made in Controls > Set up buttons (one a pad)
 
@@ -914,6 +963,10 @@ struct settings
 		num("online_max_ping", online.max_ping, 0, 1000);
 		flag("online_chime", online.chime);
 		if (auto it = kv.find("online_fighter"); it != kv.end()) { std::string v = it->second; while (!v.empty() && isspace(uint8_t(v.back()))) v.pop_back(); online.fighter = v.substr(0, 16); }
+		if (auto it = kv.find("online_room_name"); it != kv.end()) online.room_name = online_menu::clean_room(it->second);
+		num("online_room_listed", online.room_who, 0, 2);
+		num("online_rooms_show", online.rooms_show, 0, 2);
+		flag("online_quick_listed", online.quick_listed);
 		num("picture_shape", aspect, 0, N_ASPECTS - 1);
 		num("volume", volume, 0, 100);
 		num("antialiasing", aa, 0, 3);   // 1 off, 0 Low (the 3D's edges smoothed: older builds read 0 as off), 2 and 3 drawn larger
@@ -946,7 +999,7 @@ struct settings
 		if (auto it = kv.find("gpu_3d_failed"); it != kv.end()) gpu3d_failed = it->second;
 		// (older builds saved a driver as failed for any GPU error in play, a suspend or a reset: every
 		// later start on the CPU. Forgotten once, each driver tried again from this build on)
-		if (file_version < 4 && (!gpu3d_failed.empty() || !auto3d.empty())) {
+		if (file_version < 3 && (!gpu3d_failed.empty() || !auto3d.empty())) {
 			if (!gpu3d_failed.empty()) fprintf(stderr, "settings: the GPU drivers saved as failed (%s) tried again (an older build saved one failure in play for good)\n", gpu3d_failed.c_str());
 			gpu3d_failed.clear(); auto3d.clear(); upgraded = true;
 		}
@@ -970,8 +1023,13 @@ struct settings
 			if (auto it = kv.find(p ? "random_p2_name" : "random_p1_name"); it != kv.end()) random_named[p] = trimmed(it->second);
 		}
 		flag("random_opponents", random_cpu);
+		flag("debug_mode", debug_mode);
+		num("stage_select", stage, -1, vf2net::STAGES);
+		if (stage == 0) stage = -1;   // (the versus order's first: the game's own)
 		if (ring && (ring < 1300 || ring % 100)) ring = 0;   // 0: by difficulty
 		flag("fullscreen", fullscreen);
+		flag("fullscreen_window", fs_window);
+		flag("fullscreen_exclusive", fs_exclusive);
 #if defined(__ANDROID__)
 		// (a phone's screen is the window: a file from before this version has the old default, 0,
 		//  which the player couldn't have chosen — the menu opens for the first time in this one.
@@ -983,9 +1041,23 @@ struct settings
 #endif
 		flag("frame_timings", timings);
 		flag("log", log);
+		if (auto it = kv.find("language"); it != kv.end()) {   // (one this build doesn't know: auto)
+			tr::choice c;
+			language = tr::choice_from(it->second, c) ? it->second : "auto";
+		}
 		flag("arcade_mode", arcade);
 		flag("background_filter", smooth_bg);
 		flag("show_fps", show_fps);
+		flag("hud", hud);
+		num("frame_limit", frame_limit, -1, 1000);
+		if (frame_limit != -1 && frame_limit != 0 && frame_limit != 30 && frame_limit != 60 && frame_limit != 120 && frame_limit != 144) frame_limit = -1;
+		num("window_scale", window_scale, 0, 16);
+		num("window_w", window_w, 0, 65535);
+		num("window_h", window_h, 0, 65535);
+		num("window_x", window_x, -65535, 65535);
+		num("window_y", window_y, -65535, 65535);
+		flag("window_maximised", window_max);
+		if (window_w < 64 || window_h < 48) window_w = window_h = 0;
 		flag("smooth_motion", smooth);
 		for (int p = 0; p < 2; p++) ctl[p].load(kv, p);
 		// settings from before the Menu button: Arcade mode's View tapped was a coin. It stays one
@@ -1018,6 +1090,12 @@ struct settings
 				"background_filter = %d\nmusic_volume = %d\neffects_volume = %d\nantialiasing = %d\nshow_fps = %d\nscreen_filter = %d\nring_size = %d\nsmooth_motion = %d\npipelined_at = %d\narcade_coins = %d\nvsync = %d\nframes_in_flight = %d\n", scale, aspect,
 				int(fullscreen), int(timings), volume, int(arcade), int(smooth_bg), music, effects, aa, int(show_fps), filter, ring, int(smooth), pipelined_at, arcade_coin, vsync, frames_in_flight);
 		if (!log) fprintf(f, "log = 0\n");
+		fprintf(f, "language = %s\n", language.c_str());
+		fprintf(f, "window_scale = %d\n", window_scale);
+		fprintf(f, "hud = %d\nframe_limit = %d\n", int(hud), frame_limit);
+		if (fs_window) fprintf(f, "fullscreen_window = 1\n");
+		if (fs_exclusive) fprintf(f, "fullscreen_exclusive = 1\n");
+		if (window_w > 0) fprintf(f, "window_w = %d\nwindow_h = %d\nwindow_x = %d\nwindow_y = %d\nwindow_maximised = %d\n", window_w, window_h, window_x, window_y, int(window_max));
 		fprintf(f, "renderer_3d = %d\ngpu_quality = %d\nauto_3d = %s\n", renderer3d, gpu_quality, auto3d.c_str());
 		fprintf(f, "perf_hints = %d\n", perf_hints);
 		fprintf(f, "secret_character = %d\n", secret);
@@ -1027,6 +1105,8 @@ struct settings
 			if (!random_named[p].empty()) fprintf(f, "random_p%d_name = %s\n", p + 1, random_named[p].c_str());
 		}
 		if (random_cpu) fprintf(f, "random_opponents = 1\n");
+		if (debug_mode) fprintf(f, "debug_mode = 1\n");
+		if (stage >= 0) fprintf(f, "stage_select = %d\n", stage);
 		fprintf(f, "crt_colours = %d\nbrightness = %d\ngamma = %d\n", crt_colours, brightness, gamma);
 		fprintf(f, "on_screen_controls = %d\n", on_screen);
 		if (graphics) fprintf(f, "graphics = %d\n", graphics);
@@ -1039,6 +1119,8 @@ struct settings
 		if (!online.lobby.empty()) fprintf(f, "online_lobby = %s\n", online.lobby.c_str());
 		fprintf(f, "online_hide_ip = %d\nonline_max_ping = %d\nonline_chime = %d\n", int(online.hide_ip), online.max_ping, int(online.chime));
 		if (!online.fighter.empty()) fprintf(f, "online_fighter = %s\n", online.fighter.c_str());
+		if (!online.room_name.empty()) fprintf(f, "online_room_name = %s\n", online.room_name.c_str());
+		fprintf(f, "online_room_listed = %d\nonline_rooms_show = %d\nonline_quick_listed = %d\n", online.room_who, online.rooms_show, int(online.quick_listed));
 		for (int p = 0; p < 2; p++) ctl[p].save(f, p);
 		for (const std::string &m : pad_mappings) fprintf(f, "pad_mapping = %s\n", m.c_str());
 		const bool flushed = flush_to_disk(f);
@@ -1057,7 +1139,7 @@ struct settings
 // The player's ROM folder (--roms, VF2_ROMS or settings.ini's roms_folder: `folder`) is looked in
 // first and only read; without vf2.zip there, the data folder's roms/ next; a set chosen with the
 // picker then is copied into the ROM folder (where the next start looks), not the data folder.
-bool first_launch(const std::string &data, const std::string &folder, romset::result &out)
+bool first_launch(const std::string &data, const std::string &folder, romset::result &out, std::string &first_link)
 {
 	namespace fs = std::filesystem;
 	const fs::path own = fs::path(data) / "roms";
@@ -1097,25 +1179,31 @@ bool first_launch(const std::string &data, const std::string &folder, romset::re
 	}
 	SDL_Init(SDL_INIT_VIDEO);
 	const char *title = "Virtua Fighter 2";
-	const std::string where = "It's copied into " + dest.string() + ", so you only do this once.";
-	std::string note = problem + "Choose your copy of Virtua Fighter 2: MAME's \"vf2\" set (vf2.zip, Version 2.1).\n\n" + where;
+	const std::string where = tr::fill(tr::ROMS_COPIED_INTO, { { "folder", dest.string() } });
+	std::string note = problem + tr::fill(tr::ROMS_CHOOSE, { { "where", where } });   // (problem: the set's own words, English)
 	for (;;) {
 		if (!message_box(SDL_MESSAGEBOX_INFORMATION, title, note)) return false;
 		// (SDL may answer on another thread: done is set last, released, so failed and files are seen)
 		struct pick { std::atomic<bool> done{ false }; bool failed = false; std::vector<std::string> files; } chosen;
-		static const SDL_DialogFileFilter filters[] = { { "MAME ROM sets (zip)", "zip" } };
+		static std::string filter_name;   // (kept: the dialog reads it later)
+		filter_name = tr::G_ZIP_FILTER;
+		static SDL_DialogFileFilter filters[] = { { "", "zip" } };
+		filters[0].name = filter_name.c_str();
 		SDL_ShowOpenFileDialog([](void *ud, const char *const *list, int) {
 			auto *c = static_cast<pick *>(ud);
 			if (!list) c->failed = true;                  // no picker here (e.g. Steam Deck Game Mode)
 			else for (; *list; list++) c->files.push_back(*list);
 			c->done.store(true, std::memory_order_release);
 		}, &chosen, nullptr, filters, 1, nullptr, false);
-		while (!chosen.done.load(std::memory_order_acquire)) { SDL_Event e; while (SDL_PollEvent(&e)) {} SDL_Delay(10); }
+		while (!chosen.done.load(std::memory_order_acquire)) {
+			SDL_Event e;
+			while (SDL_PollEvent(&e))   // (a link that started the app, a Mac's open-URL event, kept for once the game's up)
+				if (e.type == SDL_EVENT_DROP_FILE && e.drop.data && links::is_link(e.drop.data)) first_link = std::string(e.drop.data).substr(0, 64);
+			SDL_Delay(10);
+		}
 		if (chosen.failed) {
 			fs::create_directories(dest, ec);
-			const std::string msg = "There's no file picker here. Put your vf2.zip in this folder, then start the game again:\n\n"
-									+ dest.string();
-			message_box(SDL_MESSAGEBOX_INFORMATION, title, msg);
+			message_box(SDL_MESSAGEBOX_INFORMATION, title, tr::fill(tr::ROMS_NO_PICKER, { { "folder", dest.string() } }));
 			return false;
 		}
 		if (chosen.files.empty()) return false;
@@ -1128,13 +1216,13 @@ bool first_launch(const std::string &data, const std::string &folder, romset::re
 			size_t n = 0;
 			void *d = SDL_LoadFile(f.c_str(), &n);
 			if (!d) {
-				note = "Couldn't read that file: " + std::string(SDL_GetError()) + "\n\nChoose your vf2.zip.";
+				note = tr::fill(tr::ROMS_NO_READ, { { "why", SDL_GetError() } });
 				continue;
 			}
 			const bool wrote = save_blob(zip.string(), d, n);
 			SDL_free(d);
 			if (!wrote) {
-				note = "Couldn't copy it into " + roms.string() + "\n\nChoose your vf2.zip.";
+				note = tr::fill(tr::ROMS_NO_COPY_HERE, { { "folder", roms.string() } });
 				continue;
 			}
 			f = zip.string();
@@ -1142,13 +1230,13 @@ bool first_launch(const std::string &data, const std::string &folder, romset::re
 #endif
 		romset::result r = romset::load(f);
 		if (!r.ok) {
-			note = fs::path(f).filename().string() + ": " + r.error + "\n\nChoose MAME's \"vf2\" set (vf2.zip).\n\n" + where;
+			note = tr::fill(tr::ROMS_NOT_A_SET, { { "file", fs::path(f).filename().string() }, { "why", r.error }, { "where", where } });
 			continue;
 		}
 		fs::create_directories(dest, ec);
 		if (!fs::equivalent(f, dest / "vf2.zip", ec)) fs::copy_file(f, dest / "vf2.zip", fs::copy_options::overwrite_existing, ec);
 		if (ec) {
-			note = "Couldn't copy it into " + dest.string() + ": " + ec.message() + "\n\nChoose your vf2.zip.";
+			note = tr::fill(tr::ROMS_NO_COPY, { { "folder", dest.string() }, { "why", ec.message() } });
 			continue;
 		}
 		out = std::move(r);
@@ -1199,6 +1287,7 @@ int main(int argc, char **argv)
 	// --port N the host's UDP port (7700); as Online > Play by address, started as the game is up
 	bool arg_host = false;
 	std::string arg_join;
+	std::string arg_link;   // (a link from the Online page on the web: vf2recomp://vf2/join/CODE, links.h)
 	int arg_port = 0;
 	for (int i = 1; i < argc; i++) {
 		const std::string a = argv[i];
@@ -1224,6 +1313,7 @@ int main(int argc, char **argv)
 		else if (a.rfind("--join=", 0) == 0) arg_join = a.substr(7);
 		else if (a == "--port" && i + 1 < argc) arg_port = std::clamp(atoi(argv[++i]), 1024, 65535);
 		else if (a.rfind("--port=", 0) == 0) arg_port = std::clamp(atoi(a.c_str() + 7), 1024, 65535);
+		else if (links::is_link(a)) { arg_link = a.substr(0, 64); break; }   // (nothing after a link read: on Windows that would be its own text, past a quote in it)
 		else if (a.rfind("--", 0) == 0) { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
 		else if (a.rfind("-psn_", 0) == 0) {}   // (an old macOS's Finder adds its process number)
 		else {
@@ -1243,9 +1333,9 @@ int main(int argc, char **argv)
 		if (!script.load(sp, err)) { fprintf(stderr, "%s\n", err.c_str()); return 2; }
 	}
 
-	auto fail = [](const std::string &what) {
-		fprintf(stderr, "%s\n", what.c_str());
-		if (!getenv("VF2_HIDDEN")) message_box(SDL_MESSAGEBOX_ERROR, "Virtua Fighter 2", what);   // (a test run: stderr and log.txt only)
+	auto fail = [](const tr::line &what) {   // (the log in English, the box in the menus' language)
+		fprintf(stderr, "%s\n", what.en().c_str());
+		if (!getenv("VF2_HIDDEN")) message_box(SDL_MESSAGEBOX_ERROR, "Virtua Fighter 2", what.str());   // (a test run: stderr and log.txt only)
 		return 1;
 	};
 
@@ -1279,6 +1369,9 @@ int main(int argc, char **argv)
 	}
 	if (data.empty()) data = (std::filesystem::path(zip).parent_path() / "vf2_data").string();
 	if (data.empty()) data = "vf2_data";
+	// a link with the game already running (Windows, Linux): handed to it, and this copy's done (before this one's
+	// log.txt is opened: the running one's is left as it is)
+	if (!arg_link.empty() && links::hand_over(data, arg_link)) { fprintf(stderr, "links: handed %s to the copy running\n", arg_link.c_str()); return 0; }
 	// Without a console (started from the Finder, a launcher), the messages go to log.txt there,
 	// for when something goes wrong.
 	// settings.ini's log = 0 (Game > Log file): no log.txt written, the program's messages thrown away; read here,
@@ -1294,6 +1387,9 @@ int main(int argc, char **argv)
 	if (portable) fprintf(stderr, "portable (%s): everything in %s\n", portable, data.c_str());
 	else if (home.find("/AppTranslocation/") != std::string::npos)   // (macOS runs a downloaded app from a hidden copy until it's moved)
 		fprintf(stderr, "run from macOS's hidden copy of the app (App Translocation): a portable.txt beside it isn't seen until the app is moved with the Finder\n");
+	// this one's the copy links go to, and this user's system told it opens them (not in tests)
+	links::running(data);
+	if (!getenv("VF2_HIDDEN") && !getenv("VF2_QUIT_AFTER")) { const std::string said = links::register_scheme(); if (!said.empty()) fprintf(stderr, "%s\n", said.c_str()); }
 	const std::string settings_path = data + "/settings.ini";
 	settings cfg;
 	bool cfg_dirty = false;      // saved (as the menu closes, and at exit) only when the player changed something
@@ -1304,6 +1400,14 @@ int main(int argc, char **argv)
 	// then the command line, win.
 	if (getenv("SteamDeck")) { cfg.fullscreen = true; cfg.aspect = 2; cfg.scale = 2; }
 	cfg.load(settings_path);
+	// (the menus' language: Game > Language, Auto the system's; only what the menus and the game's own dialogs show
+	// (choosing the ROM, a failed start), never the game, a match or a save)
+	{
+		tr::choice c;
+		tr::choice_from(cfg.language, c);
+		tr::set(tr::resolve(c));
+		fprintf(stderr, "the menus' language: %s (Game > Language: %s)\n", tr::code(tr::current()), cfg.language.c_str());
+	}
 	if (cfg.upgraded) cfg.save(settings_path);   // (once: a 20 chosen later is the player's)
 	if (arg_scale) cfg.scale = arg_scale;
 	if (arg_aspect >= 0) cfg.aspect = arg_aspect;
@@ -1342,12 +1446,29 @@ int main(int argc, char **argv)
 #endif
 		if (!roms_folder.empty()) fprintf(stderr, "ROM folder (%s): %s\n", from.c_str(), roms_folder.c_str());
 		else fprintf(stderr, "ROM folder: %s\n", (std::filesystem::path(data) / "roms").string().c_str());
-		if (!first_launch(data, roms_folder, roms)) return hidden ? 1 : 0;   // (a test run without the game: an error)
+		std::string first_link;   // (a link that came while the ROM was being chosen: a Mac's, the app started by it)
+		if (!first_launch(data, roms_folder, roms, first_link)) return hidden ? 1 : 0;   // (a test run without the game: an error)
+		if (arg_link.empty() && !first_link.empty()) arg_link = first_link;
 	} else {
 		roms = romset::load(zip);
 		if (!roms.ok) return fail(roms.error);
 	}
 	romset::result sound_roms = roms;   // (online play's sound board, made from them at the first match)
+	// the match found chime: the game's coin sound, made by a sound board of its own on a thread of its own (about a
+	// second of work, done long before any match)
+	std::shared_future<std::vector<int16_t>> coin = std::async(std::launch::async, [&sound_roms] { return chime::coin_or_bell(coin_sound::make(sound_roms, LEVEL), coin_sound::RATE); }).share();
+	if (const char *cw = getenv("VF2_TEST_CHIME_WAV")) {   // (tests: the match found chime's sound, the game's coin, to a .wav)
+		const std::vector<int16_t> &pcm = coin.get();
+		if (FILE *wf = fopen(cw, "wb")) {
+			const uint32_t rate = coin_sound::RATE, br = rate * 4, db = uint32_t(pcm.size() * 2), sz = 36 + db, sixteen = 16;
+			const uint16_t fmt = 1, ch = 2, al = 4, bits = 16;
+			fwrite("RIFF", 1, 4, wf); fwrite(&sz, 4, 1, wf); fwrite("WAVEfmt ", 1, 8, wf); fwrite(&sixteen, 4, 1, wf); fwrite(&fmt, 2, 1, wf);
+			fwrite(&ch, 2, 1, wf); fwrite(&rate, 4, 1, wf); fwrite(&br, 4, 1, wf); fwrite(&al, 2, 1, wf); fwrite(&bits, 2, 1, wf);
+			fwrite("data", 1, 4, wf); fwrite(&db, 4, 1, wf); fwrite(pcm.data(), 2, pcm.size(), wf);
+			fclose(wf);
+		}
+		fprintf(stderr, "(test) the match found chime: the game's coin sound, %.2f s\n", double(pcm.size() / 2) / coin_sound::RATE);
+	}
 	model2a m(std::move(roms));   // (recompiles the i960's program, unless VF2_INTERP)
 	if (arg_interp) m.use_interpreter();
 	if (m.recompiled()) {
@@ -1360,6 +1481,7 @@ int main(int argc, char **argv)
 	m.set_volumes(cfg.music / 100.0f, cfg.effects / 100.0f);
 	m.set_level(LEVEL * cfg.volume / 100.0f);
 	m.set_backdrop_filter(cfg.smooth_bg);
+	m.set_hud_hidden(!cfg.hud);   // (Display > HUD: drawing only)
 	m.set_smooth(true);   // the lists kept: smooth motion's pictures (cfg.smooth), and any picture drawn again (redraw)
 
 	const std::string backup_path = data + "/backup1", eeprom_path = data + "/eeprom";
@@ -1433,6 +1555,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "not the program known: the boot's WARNING runs in full (unseen)\n");
 	uint64_t game_frame = 0;   // frames drawn since the boot (the script's frame numbers)
 	auto boot = [&] {
+		// (Arcade settings > Debug mode: never on in the boot's frames, which a restart that turned it off ran with it
+		// on, from the frame before. The main loop turns it on again, offline, from the first frame after.)
+		m.set_debug_mode(false);
 		if (m.assignment(model2a::game_assignment::difficulty) < 0) {
 			m.reset();
 			for (int i = 0; i < 120 && m.assignment(model2a::game_assignment::difficulty) < 0; i++) m.run_frame();
@@ -1514,7 +1639,7 @@ int main(int argc, char **argv)
 	// instead of closing the game (the SDLActivity's onBackPressed asks for this hint by name)
 	SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
 #endif
-	if (!SDL_Init(SDL_INIT_VIDEO)) return fail(std::string("Couldn't start the video: ") + SDL_GetError());
+	if (!SDL_Init(SDL_INIT_VIDEO)) return fail(tr::line(tr::FAIL_VIDEO, { { "why", SDL_GetError() } }));
 	if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) fprintf(stderr, "no gamepads: %s\n", SDL_GetError());
 	// VF2_TEST_VJOY (tests): a virtual stick SDL doesn't know (10 buttons, a hat, 2 axes), pressed as it says (below)
 	SDL_Joystick *test_vjoy = nullptr;
@@ -1540,12 +1665,42 @@ int main(int argc, char **argv)
 	int win_w = 1366, win_h = 768;   // 16:9 (within 90% of a smaller screen)
 	// testing: VF2_WINDOW=WxH, the window's size in points (a hidden one as large as a player's screen)
 	const bool fixed_window = getenv("VF2_WINDOW") && sscanf(getenv("VF2_WINDOW"), "%dx%d", &win_w, &win_h) == 2;
-	{
+	bool win_placed = false;   // (the window put where it was last left; not on a phone, whose window is the screen)
+	int win_x = 0, win_y = 0;
+	if (!fixed_window) {
 		SDL_Rect usable;
-		if (!fixed_window && SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) && usable.w > 0 && usable.h > 0) {
+		if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) && usable.w > 0 && usable.h > 0) {
 			const float k = std::min({ 1.0f, usable.w * 0.9f / win_w, usable.h * 0.9f / win_h });
 			win_w = int(win_w * k); win_h = int(win_h * k);
 		}
+#if !defined(__ANDROID__)
+		// The window as last left (settings.ini's window_w ...): there if it's still all on a connected screen's usable
+		// area; else at that size (no larger than the screen) in the middle of the screen it was most on, or the primary
+		if (cfg.window_w > 0) {
+			int n = 0;
+			SDL_DisplayID *ds = SDL_GetDisplays(&n);
+			const SDL_Rect r{ cfg.window_x, cfg.window_y, cfg.window_w, cfg.window_h };
+			SDL_Rect best{ 0, 0, 0, 0 };
+			long long best_area = -1;
+			for (int i = 0; ds && i < n; i++) {
+				SDL_Rect u, in;
+				if (!SDL_GetDisplayUsableBounds(ds[i], &u) || u.w <= 0 || u.h <= 0) continue;
+				const long long a = SDL_GetRectIntersection(&r, &u, &in) ? (long long)in.w * in.h : 0;
+				if (r.x >= u.x && r.y >= u.y && r.x + r.w <= u.x + u.w && r.y + r.h <= u.y + u.h) { best = u; best_area = LLONG_MAX; break; }
+				if (a > best_area || (best_area <= 0 && ds[i] == SDL_GetPrimaryDisplay())) { best = u; best_area = a; }
+			}
+			SDL_free(ds);
+			if (best.w > 0) {
+				win_w = std::min(cfg.window_w, best.w);
+				win_h = std::min(cfg.window_h, best.h);
+				if (best_area == LLONG_MAX) { win_x = cfg.window_x; win_y = cfg.window_y; }
+				else { win_x = best.x + (best.w - win_w) / 2; win_y = best.y + (best.h - win_h) / 2; }
+				win_placed = true;
+				fprintf(stderr, "the window as last left: %d x %d at %d, %d%s%s\n", win_w, win_h, win_x, win_y,
+				        best_area == LLONG_MAX ? "" : " (centred: not all on a screen now)", cfg.window_max ? ", maximised" : "");
+			}
+		}
+#endif
 	}
 	// hidden until it has the game's first picture to show
 	// A phone's window is the screen, and it can't be resized. SDL_WINDOW_RESIZABLE there also has
@@ -1553,34 +1708,60 @@ int main(int argc, char **argv)
 	// setOrientationBis: a resizable window with no orientation hint is SCREEN_ORIENTATION_FULL_USER)
 	// instead of the landscape the manifest asks for: a session on a phone held with the rotation
 	// locked came up portrait, 1220 x 2421 in the log, its picture a 4:3 band down the middle.
-	SDL_Window *win = SDL_CreateWindow("Virtua Fighter 2", win_w, win_h,
+	// Fullscreen's way (Config's fs_window): a borderless window over the screen and a line past it, so no driver
+	// takes it for a game's own fullscreen (VF3's issue #7: AMD's Vulkan on Windows froze there, every frame waiting),
+	// the window's place, size and maximised kept for the way back; or the system's own (SDL_WINDOW_FULLSCREEN)
+#ifdef _WIN32
+	static constexpr bool FS_BORDERLESS_DEFAULT = true;
+#else
+	static constexpr bool FS_BORDERLESS_DEFAULT = false;   // (a Mac's green button and Spaces, the Deck's gamescope)
+#endif
+	auto fs_borderless = [&] { return !cfg.fs_exclusive && (FS_BORDERLESS_DEFAULT || cfg.fs_window); };
+	SDL_PropertiesID wp = SDL_CreateProperties();
+	SDL_SetStringProperty(wp, SDL_PROP_WINDOW_CREATE_TITLE_STRING, "Virtua Fighter 2");
+	SDL_SetNumberProperty(wp, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, win_w);
+	SDL_SetNumberProperty(wp, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, win_h);
+	if (win_placed) {
+		SDL_SetNumberProperty(wp, SDL_PROP_WINDOW_CREATE_X_NUMBER, win_x);
+		SDL_SetNumberProperty(wp, SDL_PROP_WINDOW_CREATE_Y_NUMBER, win_y);
+	}
+	SDL_SetNumberProperty(wp, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER,
 #if defined(__ANDROID__)
 		SDL_WINDOW_HIGH_PIXEL_DENSITY | (fullscreen ? SDL_WINDOW_FULLSCREEN : 0) | SDL_WINDOW_HIDDEN);
 #else
-		SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (fullscreen ? SDL_WINDOW_FULLSCREEN : 0) | SDL_WINDOW_HIDDEN);
+		SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (fullscreen && !fs_borderless() ? SDL_WINDOW_FULLSCREEN : 0) |
+		(win_placed && cfg.window_max ? SDL_WINDOW_MAXIMIZED : 0) | SDL_WINDOW_HIDDEN);
 #endif
-	if (!win) return fail(std::string("Couldn't open the window: ") + SDL_GetError());
+	SDL_Window *win = SDL_CreateWindowWithProperties(wp);
+	bool fs_win_on = false, fs_win_max = false;
+	SDL_Rect fs_win_was{ 0, 0, 0, 0 };
+	auto is_fullscreen = [&] { return fs_win_on || (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) != 0; };
+	SDL_DestroyProperties(wp);
+	if (!win) return fail(tr::line(tr::FAIL_WINDOW, { { "why", SDL_GetError() } }));
 	SDL_HideCursor();
 	int focus_checks = 600;   // about 5 s: going fullscreen on a Mac moves to a new Space, which takes a while
 	SDL_Renderer *ren = nullptr;
 	// Why the 3D is on the CPU when the setting isn't CPU: said on screen, not only in the log (a player whose GPU
 	// couldn't be used just saw a slow game). cpu_why_new: not said yet.
-	std::string cpu_why;
-	bool cpu_why_new = false;
+	// (its words, tr: why, what to do, and the scale cut for the run said with it: cpu_notice)
+	std::string cpu_why;          // (why, in English: empty none said)
+	tr::line cpu_why_line, cpu_todo;
+	bool cpu_why_new = false, cpu_why_cut = false;
 	bool gpu_crashed = false;   // (the last start closed while starting the GPU: the menu's row says so until a choice there)
 	bool gpu_unavailable = false;   // (the gpu renderer won't start here, or isn't tried (CRT Emudriver): the row's not "from the next start")
 	// (why: what happened, in a player's words; then what to do. None with a renderer chosen by hand, SDL_RENDER_DRIVER)
 #ifdef __APPLE__
-	static const char *UPDATE = "Updating macOS may help; the next start tries the GPU again.";
+	static const tr::text UPDATE = tr::CPU_TODO_UPDATE_MAC;
 #else
-	static const char *UPDATE = "Updating the graphics driver may help; the next start tries the GPU again.";
+	static const tr::text UPDATE = tr::CPU_TODO_UPDATE;
 #endif
 	// (every start tries the GPU again, a failure remembered only for Windows' order of drivers: only a crashed start
 	// waits for the player)
-	static const char *RETRY = "Press left or right on Display > 3D renderer to try it again from the next start.";
-	auto on_cpu_because = [&](const std::string &why, const char *what_to_do) {
-		if (cpu_why.empty() && !getenv("SDL_RENDER_DRIVER")) { cpu_why = why + "." + (*what_to_do ? std::string(" ") + what_to_do : ""); cpu_why_new = true; }
+	static const tr::text RETRY = tr::CPU_TODO_RETRY;
+	auto on_cpu_because = [&](tr::text why, tr::text what_to_do) {
+		if (cpu_why.empty() && !getenv("SDL_RENDER_DRIVER")) { cpu_why_line = why; cpu_todo = what_to_do; cpu_why = cpu_why_line.en(); cpu_why_new = true; }
 	};
+	auto cpu_notice = [&] { return tr::line(cpu_why_cut ? tr::CPU_NOTICE_CUT : tr::CPU_NOTICE, { { "why", cpu_why_line }, { "todo", cpu_todo } }); };
 	// (the GPU start's marker kept through the first 15 s of play, its shaders, first pictures and checks too, a driver
 	// that closes the game there caught as well as one in its start; taken away then, or on quitting)
 	std::string marker_live;
@@ -1607,7 +1788,7 @@ int main(int argc, char **argv)
 		const std::string cards = sysinfo::gpu_names();
 		const bool known_bad = cards.find("CRT Emudriver") != std::string::npos;
 		if (known_bad && (e ? strcmp(e, "cpu") != 0 : cfg.renderer3d != 0))
-			{ gpu_unavailable = true; fprintf(stderr, "SDL's gpu renderer: not tried with CRT Emudriver (its start crashes there): SDL's usual renderer, the CPU's 3D\n"); on_cpu_because("CRT Emudriver can't run the GPU renderer", "Choosing CPU in Display > 3D renderer hides this message."); }
+			{ gpu_unavailable = true; fprintf(stderr, "SDL's gpu renderer: not tried with CRT Emudriver (its start crashes there): SDL's usual renderer, the CPU's 3D\n"); on_cpu_because(tr::CPU_WHY_EMUDRIVER, tr::CPU_TODO_CHOOSE_CPU); }
 		// (the marker holds the build that left it: another build's, a driver or a fix since, the GPU tried again)
 		std::string marker_build;
 		bool marker_there = false;
@@ -1635,7 +1816,7 @@ int main(int argc, char **argv)
 		}
 #endif
 		if (crashed && !known_bad && (e ? strcmp(e, "cpu") != 0 : cfg.renderer3d != 0) && !getenv("SDL_RENDER_DRIVER"))
-			{ fprintf(stderr, "SDL's gpu renderer: the last start closed while starting it (%s): SDL's usual renderer, the CPU's 3D (a new build tries it again)\n", marker.c_str()); gpu_crashed = !getenv("SDL_RENDER_DRIVER"); on_cpu_because("the graphics driver closed the game the last time the GPU started", RETRY); }
+			{ fprintf(stderr, "SDL's gpu renderer: the last start closed while starting it (%s): SDL's usual renderer, the CPU's 3D (a new build tries it again)\n", marker.c_str()); gpu_crashed = !getenv("SDL_RENDER_DRIVER"); on_cpu_because(tr::CPU_WHY_CLOSED, RETRY); }
 		else if (marker_there && !known_bad && !crashed && (e ? strcmp(e, "cpu") != 0 : cfg.renderer3d != 0) && !getenv("SDL_RENDER_DRIVER"))
 			fprintf(stderr, "SDL's gpu renderer: %s closed while starting it: this build tries it again\n", marker_build.empty() ? "an older build" : marker_build.c_str());
 		if (!crashed && (e ? strcmp(e, "cpu") != 0 : cfg.renderer3d != 0) && !getenv("SDL_RENDER_DRIVER")) {
@@ -1729,13 +1910,13 @@ int main(int argc, char **argv)
 				}
 			}
 			marker_live = marker; marker_until = SDL_GetTicks() + 15000;
-			if (!ren) { fprintf(stderr, "SDL's gpu renderer: %s (SDL's usual renderer, the CPU's 3D)\n", SDL_GetError()); on_cpu_because("the GPU renderer wouldn't start", UPDATE); gpu_unavailable = true; }
+			if (!ren) { fprintf(stderr, "SDL's gpu renderer: %s (SDL's usual renderer, the CPU's 3D)\n", SDL_GetError()); on_cpu_because(tr::CPU_WHY_RENDERER, UPDATE); gpu_unavailable = true; }
 			else fprintf(stderr, "SDL's gpu renderer started in %.0f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 		}
 	}
 #endif
 	if (!ren) ren = SDL_CreateRenderer(win, nullptr);
-	if (!ren) return fail(std::string("Couldn't start the graphics: ") + SDL_GetError());
+	if (!ren) return fail(tr::line(tr::FAIL_GRAPHICS, { { "why", SDL_GetError() } }));
 	// Display's two settings for the renderer in use (the menu's rows call this too):
 	//
 	// vsync: on, the picture is shown in step with the screen (no tearing, and every picture waits
@@ -2075,7 +2256,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "the 3D on the GPU: %s (%.0f ms to start)\n", g3.dev ? g3.dev->name() : g3.next_start ? "from the next start (the CPU's 3D)" : "no GPU renderer for it here (the CPU's 3D)",
 				std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 #if defined(VF2_GPU3D_METAL) || defined(VF2_GPU3D_SDL)
-		if (!g3.dev && !g3.next_start && g3.mode != R3D_CPU) on_cpu_because("the GPU renderer couldn't start here", UPDATE);
+		if (!g3.dev && !g3.next_start && g3.mode != R3D_CPU) on_cpu_because(tr::CPU_WHY_NO_RENDERER, UPDATE);
 #endif
 	};
 	fprintf(stderr, "the 3D: %s%s\n", R3D_NAMES[g3.mode], g3.forced_mode ? " (VF2_3D)" : "");
@@ -2102,10 +2283,10 @@ int main(int argc, char **argv)
 		bool other_next = false;   // (Windows: the other driver not tried yet, so the next start tries it by itself)
 		auto say = [&] {
 			if (g3.mode == R3D_CPU) return;
-			if (keep && strstr(why, "no targets that size")) on_cpu_because("the picture is too large for the GPU at this scale", "A lower Display > Render scale puts it back on the GPU from the next start.");
-			else if (keep) on_cpu_because(strstr(why, "aren't the CPU's") ? "the GPU drew the 3D wrongly here" : "the GPU's 3D failed here",
-			                              other_next ? "The next start tries the GPU on Windows' other graphics driver." : UPDATE);
-			else on_cpu_because("the GPU's 3D stopped working", "The next start tries the GPU again.");
+			if (keep && strstr(why, "no targets that size")) on_cpu_because(tr::CPU_WHY_TOO_LARGE, tr::CPU_TODO_LOWER_SCALE);
+			else if (keep) on_cpu_because(strstr(why, "aren't the CPU's") ? tr::CPU_WHY_WRONG : tr::CPU_WHY_FAILED,
+			                              other_next ? tr::CPU_TODO_OTHER_DRIVER : UPDATE);
+			else on_cpu_because(tr::CPU_WHY_STOPPED, tr::CPU_TODO_NEXT_START);
 		};
 		g3.failed = true; g3.on = false;
 		g3_free();
@@ -2344,7 +2525,7 @@ int main(int argc, char **argv)
 			static const bool measure = getenv("VF2_AUTO_MEASURE") != nullptr;
 			// (a GPU drawn on the CPU, llvmpipe in a container or a VM, measured as before: it's several times slower)
 			on = (!measure && !soft_render) || (was || !g3.last_check ? !(g > 1.5 * c && g > 14.0) : (g <= 1.3 * c || g < 12.0));
-			if (!on && soft_render) on_cpu_because("this computer has no graphics driver for its GPU, so the CPU's own 3D is faster here", "Installing the graphics card's driver puts it on the GPU.");
+			if (!on && soft_render) on_cpu_because(tr::CPU_WHY_NO_DRIVER, tr::CPU_TODO_INSTALL);
 			auto_keep(on);
 		}
 		g3.on = on;
@@ -2426,7 +2607,7 @@ int main(int argc, char **argv)
 		return true;
 	};
 	if (!make_texture()) {   // (the GPU's 3D let go first, as at the end: before the renderer whose device it may share)
-		const std::string why = std::string("Couldn't make the picture: ") + SDL_GetError();
+		const tr::line why(tr::FAIL_PICTURE, { { "why", SDL_GetError() } });
 		g3_free();
 		g3.dev.reset();
 		return fail(why);
@@ -2560,16 +2741,20 @@ int main(int argc, char **argv)
 	// Screen filters: a picture of the monitor's glass multiplied over the game's, at the window's own
 	// pixels (made again when the picture's size changes). Scanlines darkens between the arcade's 384
 	// lines; CRT adds an aperture grille (red, green and blue stripes) and slightly darker corners.
-	const char *FILTER_NAMES[] = { "Off", "Scanlines", "CRT" };
 	SDL_Texture *glass = nullptr;
 	int glass_w = 0, glass_h = 0, glass_kind = 0;
 	// CRT colours, brightness and gamma (crt_colours.h): the game's picture drawn through them as it goes to the window
 	crt::Colours crt_paint;
 	bool crt_on = false;   // (any of them set: the menu says when this renderer can't)
 	auto draw_filter = [&] {
-		SDL_FRect r;
-		if (!cfg.filter || !SDL_GetRenderLogicalPresentationRect(ren, &r)) return;
-		const int w = int(std::lround(r.w)), h = int(std::lround(r.h));
+		SDL_FRect pic;
+		if (!cfg.filter || !SDL_GetRenderLogicalPresentationRect(ren, &pic)) return;
+		// on whole pixels, one of the glass's to each (as VF3's, vf3-recomp #7): the picture's edges can fall between
+		// them (a borderless fullscreen's 1920 x 1081, 4:3: 1441.33 wide from 239.33), and the glass stretched by a
+		// fraction, sampled to the nearest, drew one column twice in the middle (a line down the screen)
+		const float x0 = std::round(pic.x), y0 = std::round(pic.y);
+		const SDL_FRect r{ x0, y0, std::round(pic.x + pic.w) - x0, std::round(pic.y + pic.h) - y0 };
+		const int w = int(r.w), h = int(r.h);
 		if (w < 1 || h < 1) return;
 		if (!glass || w != glass_w || h != glass_h || cfg.filter != glass_kind) {
 			if (glass) SDL_DestroyTexture(glass);
@@ -2627,7 +2812,13 @@ int main(int argc, char **argv)
 			SDL_UpdateTexture(glass, nullptr, px.data(), w * 4);
 			SDL_SetTextureScaleMode(glass, SDL_SCALEMODE_NEAREST);
 		}
-		SDL_RenderTexture(ren, glass, nullptr, nullptr);   // over the picture (the logical area), under the menu
+		// over the picture, under the menu: in the window's own pixels (the logical presentation off for it)
+		int lw = 0, lh = 0;
+		SDL_RendererLogicalPresentation mode = SDL_LOGICAL_PRESENTATION_DISABLED;
+		SDL_GetRenderLogicalPresentation(ren, &lw, &lh, &mode);
+		SDL_SetRenderLogicalPresentation(ren, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+		SDL_RenderTexture(ren, glass, nullptr, &r);
+		SDL_SetRenderLogicalPresentation(ren, lw, lh, mode);
 	};
 
 	SDL_AudioStream *audio = nullptr;
@@ -2930,18 +3121,124 @@ int main(int argc, char **argv)
 		smooth_limit = false;
 		gov_calm = 0; gov_raised = false; gov_calm_need = 5;
 	};
+	// Display > Window size: the window k times the arcade's 384 lines high, in the window's own pixels (a Mac's
+	// Retina window is sized in points: the pixel density's share of them), its width the picture shape's at that
+	// height (4:3 and Fit: 512 x k, the 496 x 384 picture on its 4:3 tube; wider shapes the picture's own width, its
+	// 384 * width / 372, times k), so the picture fills it and each arcade line is k of the screen's; only the sizes
+	// that fit the screen's usable area. In fullscreen it waits for the window. Resized by hand: Free again. Not on a
+	// phone (its window is the screen).
+	int win_expect_w = 0, win_expect_h = 0;   // (the window's pixels as Window size made them)
+	int win_set_w = 0, win_set_h = 0;         // (and its points)
+	bool window_moved = false;                // (moved, resized, maximised: remembered after the pass's events)
+	bool window_rescale = false;              // (made again after this pass's events: out of the OS's fullscreen, or
+	                                          // moved to a screen of another pixel density)
+	auto window_target = [&](int k, int &w, int &h) {
+		h = 384 * k;
+		w = aspect_i <= 1 ? 512 * k : int(std::lround(384.0 * m.width() / 372.0)) * k;
+	};
+	auto window_fits = [&](int k) {
+		int w, h;
+		window_target(k, w, h);
+		const float d = std::max(SDL_GetWindowPixelDensity(win), 0.25f);
+		SDL_Rect usable;
+		if (!SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(win), &usable) || usable.w <= 0 || usable.h <= 0) return k == 1;
+		int top = 0, left = 0, bottom = 0, right = 0;
+		if (!SDL_GetWindowBordersSize(win, &top, &left, &bottom, &right)) top = left = bottom = right = 0;
+		return w / d + left + right <= usable.w && h / d + top + bottom <= usable.h;
+	};
+	auto window_scale_most = [&] {
+		int k = 0;
+		while (k < 16 && window_fits(k + 1)) k++;
+		return k;
+	};
+	auto apply_window_scale = [&] {
+#if defined(__ANDROID__)
+		return;
+#endif
+		if (cfg.window_scale <= 0 || is_fullscreen() || fixed_window) return;
+		const int most = window_scale_most();
+		if (cfg.window_scale > most) {
+			fprintf(stderr, "window size %dx: larger than the screen, %s\n", cfg.window_scale, most ? "the largest that fits" : "Free");
+			cfg.window_scale = most;
+			cfg_dirty = true;
+			if (!most) return;
+		}
+		int w, h;
+		window_target(cfg.window_scale, w, h);
+		if (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) { SDL_RestoreWindow(win); SDL_SyncWindow(win); }
+		const float d = std::max(SDL_GetWindowPixelDensity(win), 0.25f);
+		int pw = int(std::lround(w / d)), ph = int(std::lround(h / d));
+		SDL_SetWindowSize(win, pw, ph);
+		SDL_SyncWindow(win);
+		int gw = 0, gh = 0;
+		SDL_GetWindowSizeInPixels(win, &gw, &gh);
+		if ((gw != w || gh != h) && gw > 0 && gh > 0) {   // (a fractional density's rounding: a point more or less)
+			pw += gw < w ? 1 : gw > w ? -1 : 0;
+			ph += gh < h ? 1 : gh > h ? -1 : 0;
+			SDL_SetWindowSize(win, pw, ph);
+			SDL_SyncWindow(win);
+			SDL_GetWindowSizeInPixels(win, &gw, &gh);
+		}
+		win_expect_w = gw; win_expect_h = gh;
+		win_set_w = pw; win_set_h = ph;
+		SDL_FlushEvent(SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED);   // (its own sizes on the way: not the player's resize)
+		fprintf(stderr, "window size %dx: %d x %d pixels (%d x %d points, density %.2f)%s\n", cfg.window_scale, gw, gh, pw, ph, d,
+		        gw == w && gh == h ? "" : ": not the size asked");
+		if (!aspect_i && apply_aspect()) reshape();   // (Fit: the picture's shape the window's new one)
+	};
+	// the window's place and size kept in the settings as the player leaves them, in a window only (not fullscreen;
+	// maximised: said so, the size under it kept); not for VF2_WINDOW's tests, nor a phone
+	auto remember_window = [&] {
+#if defined(__ANDROID__)
+		return;
+#endif
+		if (fixed_window || is_fullscreen()) return;
+		const SDL_WindowFlags fl = SDL_GetWindowFlags(win);
+		if (fl & SDL_WINDOW_MINIMIZED) return;
+		const bool mx = (fl & SDL_WINDOW_MAXIMIZED) != 0;
+		int w = cfg.window_w, h = cfg.window_h, x = cfg.window_x, y = cfg.window_y;
+		if (!mx || w <= 0) { SDL_GetWindowSize(win, &w, &h); SDL_GetWindowPosition(win, &x, &y); }   // (maximised from the first: its size then)
+		if (w <= 0 || h <= 0) return;
+		if (w == cfg.window_w && h == cfg.window_h && x == cfg.window_x && y == cfg.window_y && mx == cfg.window_max) return;
+		cfg.window_w = w; cfg.window_h = h; cfg.window_x = x; cfg.window_y = y; cfg.window_max = mx;
+		cfg_dirty = true;
+	};
+	auto set_window_scale = [&](int k) { cfg.window_scale = std::max(k, 0); cfg_dirty = true; apply_window_scale(); };
 	auto set_shape = [&](int v) {
 		aspect_i = cfg.aspect = v; cfg_dirty = true;
 		apply_aspect();
 		reshape();   // (the title too)
+		apply_window_scale();   // (Window size: the new shape's width)
 		gov_fresh();
 	};
 	auto set_fullscreen = [&](bool on) {
 		cfg.fullscreen = on; cfg_dirty = true;
-		SDL_SetWindowFullscreen(win, on);
+		SDL_Rect b;
+		if (on && !fs_win_on && fs_borderless() && SDL_GetDisplayBounds(SDL_GetDisplayForWindow(win), &b)) {
+			if (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) { SDL_SetWindowFullscreen(win, false); SDL_SyncWindow(win); }
+			fs_win_max = (SDL_GetWindowFlags(win) & SDL_WINDOW_MAXIMIZED) != 0;
+			if (fs_win_max) { SDL_RestoreWindow(win); SDL_SyncWindow(win); }   // (the size under it, for the way back)
+			SDL_GetWindowPosition(win, &fs_win_was.x, &fs_win_was.y);
+			SDL_GetWindowSize(win, &fs_win_was.w, &fs_win_was.h);
+			SDL_SetWindowBordered(win, false);
+			SDL_SetWindowPosition(win, b.x, b.y);
+			SDL_SetWindowSize(win, b.w, b.h + 1);
+			fs_win_on = true;
+			fprintf(stderr, "fullscreen: a borderless window, %d x %d%s\n", b.w, b.h + 1,
+			        cfg.fs_window ? " (fullscreen_window)" : " (fullscreen_exclusive = 1 for the driver's own)");
+		} else if (!on && fs_win_on) {
+			SDL_SetWindowBordered(win, true);
+			if (fs_win_was.w > 0) { SDL_SetWindowSize(win, fs_win_was.w, fs_win_was.h); SDL_SetWindowPosition(win, fs_win_was.x, fs_win_was.y); }
+			if (fs_win_max) SDL_MaximizeWindow(win);
+			fs_win_on = false;
+		} else if (!fs_win_on) SDL_SetWindowFullscreen(win, on);
 		SDL_SyncWindow(win);     // macOS animates into fullscreen: wait for it to finish
+		if (!on) apply_window_scale();
 		gov_fresh();
 	};
+	// borderless fullscreen from the start: the window (made at its remembered place and size) over the screen
+	if (cfg.fullscreen && fs_borderless()) { const bool d = cfg_dirty; set_fullscreen(true); cfg_dirty = d; }
+	apply_window_scale();   // (the saved Window size from the start; VF2_WINDOW's tests: the size they ask)
 	// The game on a thread of its own while the screen waits (VF3's job_start and job_wait, VF1's
 	// game thread): with smooth motion, a frame that will be due by the next refresh is run during
 	// the present's wait for vsync, its inputs set as the frame before it ended (as ever); what
@@ -2956,7 +3253,20 @@ int main(int argc, char **argv)
 	// Reset (the menu, F3): the menu closes, a paused game unpauses, and the screen goes black at
 	// once while the boot runs unseen, not the last picture held.
 	// the arcade settings as their page opened (and the ring): see arcade_page
-	std::optional<std::array<int, 11>> assign_before;
+	std::optional<std::array<int, 12>> assign_before;
+	// Arcade settings > Debug mode changed: the board powered on before the restart, its backup RAM and EEPROM kept (as
+	// the netplay adapter's cold start). A restart keeps the work RAM, where the debug mode's bit (14 of 0x508000) and
+	// what it wrote stay: the game then as from a start, exactly
+	auto cold_start = [&] {
+		if (g_match_board) return;
+		finish_async(false);
+		const std::vector<u8> backup = m.backup_ram();
+		u16 eeprom[64];
+		memcpy(eeprom, m.eeprom_cells(), sizeof eeprom);
+		m.power_on();
+		m.backup_ram() = backup;
+		memcpy(m.eeprom_cells(), eeprom, sizeof eeprom);
+	};
 	auto reset_game = [&] {
 		// (never on a match's board: the host's settings booted, the same on both sides; end_match gives this player's
 		// back first)
@@ -2986,7 +3296,7 @@ int main(int argc, char **argv)
 		cfg.timings = timings;
 		return cfg.save(settings_path);
 	};
-	auto on_off = [](bool b) { return std::string(b ? "On" : "Off"); };
+	auto on_off = [](bool b) { return std::string(b ? tr::ON : tr::OFF); };
 	auto wrap = [](int v, int n) { return (v % n + n) % n; };
 	// The on-screen controls (a touch screen): a d-pad, Guard, Punch and Kick, Start and a Menu
 	// button over the picture (src/host/touch_controls.h). Auto shows them while player 1 has no
@@ -3003,33 +3313,43 @@ int main(int argc, char **argv)
 	auto touch_shown = [&] {
 		return !menu.is_open() && (cfg.on_screen == 2 || (cfg.on_screen == 1 && touch_present && !pads[0]));
 	};
-	auto back_item = [&] { return menu_item{ "Back", "Back to the previous page.", {}, {}, [&] { menu.pop(); } }; };
+	auto back_item = [&] { return menu_item{ tr::BACK, tr::BACK_HELP, {}, {}, [&] { menu.pop(); } }; };
+	// Game > Language: the setting, and the menus made again in the language at once (the page it's on kept)
+	std::function<void()> menus_relabelled;   // (set below, with the pages)
+	auto language_choice = [&] { tr::choice c; tr::choice_from(cfg.language, c); return c; };
+	auto set_language = [&](tr::choice c) {
+		cfg.language = tr::choice_key(c);
+		cfg_dirty = true;
+		tr::set(tr::resolve(c));
+		fprintf(stderr, "Game > Language: %s (the menus in %s)\n", cfg.language.c_str(), tr::code(tr::current()));
+		menu.set_language();
+		if (menus_relabelled) menus_relabelled();
+	};
+	auto x_n = [](int n) { return tr::fill(tr::N_X, { { "n", std::to_string(n) } }); };
 	auto display_page = [&] {
-		menu_page p{ "Display", "", {} };
-		p.items.push_back({ "Render scale",
-			"How sharp the 3D is. 1x is the original arcade resolution; higher is sharper but needs a faster computer. If yours can't keep up, the game lowers it for you. (F5)",
-			[&] { return std::to_string(scale) + "x" + (scale < scale_wanted ? " (" + std::to_string(scale_wanted) + "x narrower)" : std::string()); },
+		menu_page p{ tr::P_DISPLAY, "", {} };
+		p.items.push_back({ tr::D_SCALE, tr::D_SCALE_HELP,
+			[&] { return scale < scale_wanted ? tr::fill(tr::D_SCALE_NARROWER, { { "n", std::to_string(scale) }, { "want", std::to_string(scale_wanted) } }) : x_n(scale); },
 			[&](int d) { set_scale(std::clamp(scale_wanted + d, 1, MAX_SCALE)); } });
-		p.items.push_back({ "Antialiasing",
-			"Smooths jagged edges on the 3D. Low smooths them after drawing and costs little; 2x and 3x draw the picture larger and look cleaner but take a lot more power.",
-			[&] { return aa == 0 ? std::string("Low") : aa_now() == 1 ? std::string(aa > 1 ? "Off (too large here)" : "Off") : std::to_string(aa_now()) + "x"; },
+		p.items.push_back({ tr::D_AA, tr::D_AA_HELP,
+			[&] { return aa == 0 ? std::string(tr::D_AA_LOW) : aa_now() == 1 ? std::string(aa > 1 ? tr::D_AA_OFF_TOO_LARGE : tr::OFF) : x_n(aa_now()); },
 			[&](int d) {
 				static const int ORDER[] = { 1, 0, 2, 3 };   // Off, Low, 2x, 3x (as vf1-recomp)
 				int i = 0;
 				while (i < 3 && ORDER[i] != cfg.aa) i++;
 				cfg.aa = ORDER[std::clamp(i + d, 0, 3)]; aa = cfg.aa; set_scale(player_scale);   // (a scale the governor lowered: the player's again)
 			} });
-		p.items.push_back({ "3D renderer",
-			"Which part of your computer draws the 3D. Auto uses the GPU whenever it draws correctly here (it checks as the game starts). CPU and GPU draw the same picture; the GPU is faster and frees the processor. If the GPU closed the game as it started, the CPU draws it until you choose again here.",
+		p.items.push_back({ tr::D_RENDERER, tr::D_RENDERER_HELP,
 			[&] {
+				const tr::text names[] = { tr::R3D_CPU, tr::R3D_GPU, tr::AUTO };   // (R3D_NAMES' order: the log's English)
 #if !defined(VF2_GPU3D_METAL) && !defined(VF2_GPU3D_SDL)
-				return std::string("CPU (no GPU support in this build)");
+				return std::string(tr::D_R3D_NO_BUILD);
 #endif
-				if (!g3.dev && gpu_crashed) return std::string("CPU (GPU crashed: choose to retry)");
-				if (!g3.dev && g3.next_start && g3.mode != R3D_CPU) return std::string(R3D_NAMES[g3.mode]) + " (from the next start)";
-				if (!g3.dev) return std::string(g3.mode == R3D_CPU ? "CPU" : g3.tried ? "CPU (no GPU support here)" : R3D_NAMES[g3.mode]);
-				if (g3.mode == R3D_AUTO) return std::string("Auto (") + (g3.on ? "GPU" : "CPU") + ")";
-				return std::string(g3.failed && g3.mode == R3D_GPU ? "GPU (failed: CPU)" : R3D_NAMES[g3.mode]);
+				if (!g3.dev && gpu_crashed) return std::string(tr::D_R3D_CRASHED);
+				if (!g3.dev && g3.next_start && g3.mode != R3D_CPU) return tr::fill(tr::D_R3D_NEXT_START, { { "what", names[g3.mode] } });
+				if (!g3.dev) return std::string(g3.mode == R3D_CPU ? tr::R3D_CPU : g3.tried ? tr::D_R3D_NO_GPU : names[g3.mode]);
+				if (g3.mode == R3D_AUTO) return tr::fill(tr::AUTO_IS, { { "what", g3.on ? tr::R3D_GPU : tr::R3D_CPU } });
+				return std::string(g3.failed && g3.mode == R3D_GPU ? tr::D_R3D_FAILED : names[g3.mode]);
 			},
 			[&](int d) {
 #if !defined(VF2_GPU3D_METAL) && !defined(VF2_GPU3D_SDL)
@@ -3056,9 +3376,8 @@ int main(int argc, char **argv)
 				log_state("the player's 3D renderer");
 			} });
 #ifdef _WIN32
-		p.items.push_back({ "Graphics driver",
-			"Which of Windows' graphics drivers the GPU uses. Auto starts on Vulkan, and on Direct3D 12 if Vulkan won't start or can't draw the game's 3D. Pick Direct3D 12 if the game runs better on it here. Takes effect the next time the game starts.",
-			[&] { return std::string(cfg.graphics ? "Direct3D 12" : "Auto (Vulkan first)"); },
+		p.items.push_back({ tr::D_DRIVER, tr::D_DRIVER_HELP,
+			[&] { return std::string(cfg.graphics ? "Direct3D 12" : tr::D_DRIVER_AUTO.c_str()); },
 			[&](int) {
 				cfg.graphics = !cfg.graphics; cfg_dirty = true;
 				SDL_RemovePath((data + "/gpu-start.crashed").c_str());   // (another driver: a crashed start tried again with it)
@@ -3068,9 +3387,8 @@ int main(int argc, char **argv)
 				menu.toast("");
 			} });
 #endif
-		if (g3.dev && !strcmp(g3.dev->name(), "metal")) p.items.push_back({ "GPU quality",
-			"Exact draws the 3D on the GPU pixel for pixel as the CPU does. Fast takes shortcuts: quicker on a slow graphics card, with slight differences in texture detail and at edges.",
-			[&] { return std::string(cfg.gpu_quality ? "Fast" : "Exact"); },
+		if (g3.dev && !strcmp(g3.dev->name(), "metal")) p.items.push_back({ tr::D_GPU_QUALITY, tr::D_GPU_QUALITY_HELP,
+			[&] { return std::string(cfg.gpu_quality ? tr::D_FAST : tr::D_EXACT); },
 			[&](int) {
 				cfg.gpu_quality = !cfg.gpu_quality; cfg_dirty = true;
 				if (!g3.dev) return;
@@ -3079,89 +3397,124 @@ int main(int argc, char **argv)
 				g3_decide("the player's GPU quality", true);
 				redraw_shown();
 			} });
-		p.items.push_back({ "Picture shape",
-			"Fit the window fills any screen shape. The other shapes add black bars to keep their shape; 4:3 is the original arcade screen. (F6)",
-			[&] { return std::string(aspect_i ? ASPECT_NAMES[aspect_i] : "Fit the window"); },
+		p.items.push_back({ tr::D_SHAPE, tr::D_SHAPE_HELP,
+			[&] { return std::string(aspect_i ? ASPECT_NAMES[aspect_i] : tr::D_SHAPE_FIT.c_str()); },
 			[&](int d) { set_shape(wrap(aspect_i + d, N_ASPECTS)); } });
-		p.items.push_back({ "Background filter",
-			"Smooth softens the stage backgrounds so they don't look blocky when enlarged. Off keeps their original pixels. Only matters above 1x.",
-			[&] { return std::string(cfg.smooth_bg ? "Smooth" : "Off"); },
+		p.items.push_back({ tr::D_BG_FILTER, tr::D_BG_FILTER_HELP,
+			[&] { return std::string(cfg.smooth_bg ? tr::D_SMOOTH : tr::OFF); },
 			[&](int) {
 				cfg.smooth_bg = !cfg.smooth_bg; cfg_dirty = true;
 				m.set_backdrop_filter(cfg.smooth_bg);
 				redraw_shown();
 			} });
-		p.items.push_back({ "Smooth motion",
-			"On: a picture for each refresh of your screen (up to 120 a second), placed between the arcade's 57.5 frames a second, a frame behind them. Off: only the arcade's own frames, as on the cabinet (uneven on most screens).",
+		p.items.push_back({ tr::D_SMOOTH_MOTION, tr::D_SMOOTH_MOTION_HELP,
 			[&] { return on_off(cfg.smooth); },
 			[&](int) { cfg.smooth = !cfg.smooth; cfg_dirty = true; gov_fresh(); } });   // (the picture on show stays)
-		p.items.push_back({ "Screen filter",
-			"Scanlines adds the dark lines between the arcade monitor's rows. CRT adds those, the monitor's red, green and blue stripes, and slightly darker corners. The lines need a large window or fullscreen to show.",
-			[&] { return std::string(FILTER_NAMES[cfg.filter]); },
+		p.items.push_back({ tr::D_SCREEN_FILTER, tr::D_SCREEN_FILTER_HELP,
+			[&] { const tr::text names[] = { tr::OFF, tr::D_SCANLINES, tr::D_CRT }; return std::string(names[cfg.filter]); },
 			[&](int d) { cfg.filter = wrap(cfg.filter + d, 3); cfg_dirty = true; } });
-		p.items.push_back({ "CRT colours",
-			"The colours as an arcade monitor showed them, as Supermodel's CRT colours. Sega arcade is a Japanese cabinet's: bluer whites and richer colours. The others are a Sony studio monitor and the TV standards of Japan, the US and Europe. Off: the game's colours as they are.",
-			[&] { return std::string(crt::PRESETS[cfg.crt_colours].name) + (crt_on && crt_paint.failed() ? " (not with this renderer)" : ""); },
+		p.items.push_back({ tr::D_CRT_COLOURS, tr::D_CRT_COLOURS_HELP,
+			[&] {
+				const tr::text names[] = { tr::OFF, tr::CRT_SEGA, tr::CRT_SONY, tr::CRT_NTSC_JP, tr::CRT_NTSC_US, tr::CRT_PAL };
+				static_assert(sizeof names / sizeof names[0] == crt::N_PRESETS, "a name for each of crt::PRESETS");
+				const std::string n = names[cfg.crt_colours];
+				return crt_on && crt_paint.failed() ? tr::fill(tr::NOT_WITH_RENDERER, { { "what", n } }) : n;
+			},
 			[&](int d) { cfg.crt_colours = wrap(cfg.crt_colours + d, crt::N_PRESETS); cfg_dirty = true; } });
-		p.items.push_back({ "Brightness",
-			"The picture's brightness, for your screen: 100% is the game's own. Brighter lifts the whole picture (the brightest parts stay white).",
-			[&] { return std::to_string(cfg.brightness) + "%" + (crt_on && crt_paint.failed() ? " (not with this renderer)" : ""); },
+		p.items.push_back({ tr::D_BRIGHTNESS, tr::D_BRIGHTNESS_HELP,
+			[&] { const std::string n = tr::fill(tr::N_PERCENT, { { "n", std::to_string(cfg.brightness) } }); return crt_on && crt_paint.failed() ? tr::fill(tr::NOT_WITH_RENDERER, { { "what", n } }) : n; },
 			[&](int d) { cfg.brightness = std::clamp(cfg.brightness + 5 * d, crt::BRIGHT_MIN, crt::BRIGHT_MAX); cfg_dirty = true; } });
-		p.items.push_back({ "Gamma",
-			"The middle tones, for your screen: 100% is the game's own. Higher brings the dark parts up without washing out the blacks or the whites; lower makes them deeper.",
-			[&] { return std::to_string(cfg.gamma) + "%" + (crt_on && crt_paint.failed() ? " (not with this renderer)" : ""); },
+		p.items.push_back({ tr::D_GAMMA, tr::D_GAMMA_HELP,
+			[&] { const std::string n = tr::fill(tr::N_PERCENT, { { "n", std::to_string(cfg.gamma) } }); return crt_on && crt_paint.failed() ? tr::fill(tr::NOT_WITH_RENDERER, { { "what", n } }) : n; },
 			[&](int d) { cfg.gamma = std::clamp(cfg.gamma + 5 * d, crt::GAMMA_MIN, crt::GAMMA_MAX); cfg_dirty = true; } });
-		p.items.push_back({ "Show FPS", "Shows the frame rate in the top right corner.",
+		p.items.push_back({ tr::D_SHOW_FPS, tr::D_SHOW_FPS_HELP,
 			[&] { return on_off(cfg.show_fps); },
 			[&](int) { cfg.show_fps = !cfg.show_fps; cfg_dirty = true; if (!cfg.show_fps) menu.set_fps(""); } });
+		p.items.push_back({ tr::D_HUD, tr::D_HUD_HELP,
+			[&] { return on_off(cfg.hud); },
+			[&](int) { cfg.hud = !cfg.hud; cfg_dirty = true; m.set_hud_hidden(!cfg.hud); redraw_shown(); } });
 		{
 			int now = 0;
 			if (SDL_GetRenderVSync(ren, &now))
-				p.items.push_back({ "Vsync",
-					"On: a picture is shown in step with the screen (no tearing), and every picture waits for the screen's next refresh. Off: no waiting, so more pictures a second where the screen's refresh is high (a phone's is 120), at the price of some tearing.",
+				p.items.push_back({ tr::D_VSYNC, tr::D_VSYNC_HELP,
 					[&] { int v = 0; SDL_GetRenderVSync(ren, &v); return on_off(v != 0); },
 					[&](int) { cfg.vsync = !cfg.vsync; cfg_dirty = true; apply_display_settings(); } });
 		}
+		p.items.push_back({ tr::D_FRAME_LIMIT, tr::D_FRAME_LIMIT_HELP,
+			[&] {
+				if (cfg.frame_limit == 0) return std::string(tr::OFF);
+				if (cfg.frame_limit < 0) {
+					const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(win));
+					return tr::fill(tr::D_FRAME_LIMIT_SCREEN, { { "n", std::to_string(int(std::lround(dm && dm->refresh_rate > 0 ? dm->refresh_rate : 60.0f))) } });
+				}
+				return std::to_string(cfg.frame_limit);
+			},
+			[&](int d) {
+				static const int ORDER[] = { 0, 30, 60, 120, 144, -1 };
+				int i = 0;
+				while (i < 5 && ORDER[i] != cfg.frame_limit) i++;
+				cfg.frame_limit = ORDER[wrap(i + d, 6)];
+				cfg_dirty = true;
+				fprintf(stderr, "Display > Frame limit: %d (0 none, -1 the screen's)\n", cfg.frame_limit);
+			} });
 		if (const char *renderer_now = SDL_GetRendererName(ren); renderer_now && !strcmp(renderer_now, "gpu"))
-			p.items.push_back({ "GPU frames in flight",
-				"How many frames SDL's gpu renderer may have in flight (1 to 3). 1 is the shortest delay between a finger and the screen, but every picture then waits for the one before it to be drawn: the drawing and the GPU's work follow one another instead of going alongside, and the GPU's own time for a picture lands in the frame's. 2 or 3 let the drawing get ahead of the GPU — the same pictures, more of them a second, one or two frames more delay.",
+			p.items.push_back({ tr::D_FRAMES_IN_FLIGHT, tr::D_FRAMES_IN_FLIGHT_HELP,
 				[&] { return std::to_string(cfg.frames_in_flight); },
 				[&](int d) { cfg.frames_in_flight = std::clamp(cfg.frames_in_flight + d, 1, 3); cfg_dirty = true; apply_display_settings(); } });
 #if defined(__ANDROID__)
 		if (sysinfo::perf_hints_available())
-			p.items.push_back({ "Performance hints",
-				"Android's own hint session over the threads that put a frame together, with a frame's 17.4 ms as its target: the phone then keeps their cores and the GPU at their clocks instead of taking the game for a program in the background. Off, to compare a run without it.",
+			p.items.push_back({ tr::D_PERF_HINTS, tr::D_PERF_HINTS_HELP,
 				[&] { return on_off(cfg.perf_hints); },
 				[&](int) { cfg.perf_hints = !cfg.perf_hints; cfg_dirty = true; apply_perf_hints(); } });
 #endif
-		p.items.push_back({ "Fullscreen", "Play fullscreen or in a window. (F11, F or Alt+Enter)",
-			[&] { return on_off(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN); },
-			[&](int) { set_fullscreen(!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN)); } });
-		p.items.push_back({ "On-screen controls",
-			"For a touch screen: a d-pad, Guard, Punch and Kick, Start and a Menu button over the picture, to play without a pad. Auto shows them while player 1 has no pad.",
-			[&] { return cfg.on_screen == 0 ? std::string("Off") : cfg.on_screen == 2 ? std::string("On") : std::string("Auto (no pad)"); },
+#if !defined(__ANDROID__)
+		p.items.push_back({ tr::D_WINDOW_SIZE, tr::D_WINDOW_SIZE_HELP,
+			[&] {
+				if (cfg.window_scale <= 0) return std::string(tr::D_FREE);
+				int w, h;
+				window_target(cfg.window_scale, w, h);
+				return tr::fill(is_fullscreen() ? tr::D_WINDOW_N_IN_WINDOW : tr::D_WINDOW_N, { { "n", std::to_string(cfg.window_scale) }, { "w", std::to_string(w) }, { "h", std::to_string(h) } });
+			},
+			[&](int d) { set_window_scale(wrap(cfg.window_scale + d, window_scale_most() + 1)); } });
+#endif
+		p.items.push_back({ tr::D_FULLSCREEN, tr::D_FULLSCREEN_HELP,
+			[&] { return on_off(is_fullscreen()); },
+			[&](int) { set_fullscreen(!is_fullscreen()); } });
+#ifdef _WIN32
+		p.items.push_back({ tr::D_FS_MODE, tr::D_FS_MODE_HELP,
+			[&] { return std::string(fs_borderless() ? tr::D_BORDERLESS : tr::D_STANDARD); },
+			[&](int) {
+				const bool was = is_fullscreen();
+				if (was) set_fullscreen(false);
+				cfg.fs_exclusive = fs_borderless(); cfg_dirty = true;
+				if (was) set_fullscreen(true);
+				menu.refresh();
+			} });
+#endif
+		p.items.push_back({ tr::D_ON_SCREEN, tr::D_ON_SCREEN_HELP,
+			[&] { return std::string(cfg.on_screen == 0 ? tr::OFF : cfg.on_screen == 2 ? tr::ON : tr::D_ON_SCREEN_AUTO); },
 			[&](int d) { cfg.on_screen = wrap(cfg.on_screen + d, 3); cfg_dirty = true; if (!touch_shown()) touch.release(); } });
 		p.items.push_back(back_item());
 		return p;
 	};
 	auto sound_page = [&] {
-		menu_page p{ "Sound", "", {} };
-		p.items.push_back({ "Volume", "The overall volume.",
-			[&] { return std::to_string(cfg.volume) + "%"; },
+		menu_page p{ tr::P_SOUND, "", {} };
+		p.items.push_back({ tr::S_VOLUME, tr::S_VOLUME_HELP,
+			[&] { return tr::fill(tr::N_PERCENT, { { "n", std::to_string(cfg.volume) } }); },
 			[&](int d) {
 				cfg.volume = std::clamp(cfg.volume + 10 * d, 0, 100); cfg_dirty = true;
 				m.set_level(LEVEL * cfg.volume / 100.0f);
 				g_match_volumes = pack_volumes(cfg.volume, cfg.music, cfg.effects);
 			} });
-		p.items.push_back({ "Music", "The music's volume, within the overall volume.",
-			[&] { return std::to_string(cfg.music) + "%"; },
+		p.items.push_back({ tr::S_MUSIC, tr::S_MUSIC_HELP,
+			[&] { return tr::fill(tr::N_PERCENT, { { "n", std::to_string(cfg.music) } }); },
 			[&](int d) {
 				cfg.music = std::clamp(cfg.music + 10 * d, 0, 100); cfg_dirty = true;
 				m.set_volumes(cfg.music / 100.0f, cfg.effects / 100.0f);
 				g_match_volumes = pack_volumes(cfg.volume, cfg.music, cfg.effects);
 			} });
-		p.items.push_back({ "Effects and voices", "Hits, voices and the announcer, within the overall volume.",
-			[&] { return std::to_string(cfg.effects) + "%"; },
+		p.items.push_back({ tr::S_EFFECTS, tr::S_EFFECTS_HELP,
+			[&] { return tr::fill(tr::N_PERCENT, { { "n", std::to_string(cfg.effects) } }); },
 			[&](int d) {
 				cfg.effects = std::clamp(cfg.effects + 10 * d, 0, 100); cfg_dirty = true;
 				m.set_volumes(cfg.music / 100.0f, cfg.effects / 100.0f);
@@ -3171,20 +3524,23 @@ int main(int argc, char **argv)
 		return p;
 	};
 	auto game_page = [&] {
-		menu_page p{ "Game", "", {} };
-		p.items.push_back({ "Play style",
-			"PC skips the boot screen and is always free play. Arcade has the boot screen, coins and credits, like the real cabinet: Start needs a credit, and Coin adds one (5 and 6, or set it in Controls: a key, or a pad button such as View); its coin settings are kept for it. Changing it restarts the game.",
-			[&] { return std::string(cfg.arcade ? "Arcade" : "PC"); },
+		menu_page p{ tr::P_GAME, "", {} };
+		p.items.push_back({ tr::G_LANGUAGE, tr::G_LANGUAGE_HELP,
+			[&] {
+				const tr::choice c = language_choice();
+				return c.automatic() ? tr::fill(tr::LANG_AUTO_IS, { { "lang", tr::info(tr::system()).name } }) : tr::choice_name(c);
+			},
+			[&](int d) { set_language(tr::step(language_choice(), d)); } });
+		p.items.push_back({ tr::G_PLAY_STYLE, tr::G_PLAY_STYLE_HELP,
+			[&] { return std::string(cfg.arcade ? tr::G_ARCADE : tr::G_PC); },
 			[&](int) {
 				cfg.arcade = !cfg.arcade; g_pc_mode = !cfg.arcade; cfg_dirty = true;
 				apply_play_style();
 				reset_game();   // (boot gives the coin setting to the style now in use)
 			} });
-		p.items.push_back({ "Reset game",
-			"Restarts the game, like switching the arcade off and on. Rankings and settings are kept. (F3)",
+		p.items.push_back({ tr::G_RESET, tr::G_RESET_HELP,
 			{}, {}, [&] { reset_game(); } });
-		p.items.push_back({ "Log file",
-			"log.txt in the data folder: what the game did, a few kilobytes a session, kept for bug reports (send it with one). Off, nothing's written. From the next start.",
+		p.items.push_back({ tr::G_LOG, tr::G_LOG_HELP,
 			[&] { return on_off(cfg.log); }, [&](int) { cfg.log = !cfg.log; cfg_dirty = true; }, [&] { cfg.log = !cfg.log; cfg_dirty = true; } });
 		p.items.push_back(back_item());
 		return p;
@@ -3193,31 +3549,30 @@ int main(int argc, char **argv)
 	// starts, so closing the menu after changing one restarts it (only if something is different) ----
 	using ga = model2a::game_assignment;
 	constexpr int N_ASSIGN = 7;
-	static_assert(std::tuple_size_v<decltype(assign_before)::value_type> == N_ASSIGN + 4);
+	static_assert(std::tuple_size_v<decltype(assign_before)::value_type> == N_ASSIGN + 5);
 	auto assignments_now = [&] {
-		std::array<int, N_ASSIGN + 4> v;
+		std::array<int, N_ASSIGN + 5> v;
 		for (int i = 0; i < N_ASSIGN; i++) v[i] = m.assignment(ga(i));
 		v[N_ASSIGN] = cfg.ring;
 		v[N_ASSIGN + 1] = cfg.secret;   // (Cheats: the select sets the fighter as it opens, so it restarts too)
 		v[N_ASSIGN + 2] = cfg.random_cpu;   // (and the random fighters: each player's, Random opponents)
 		v[N_ASSIGN + 3] = int(std::hash<std::string>{}(cfg.random_player[0] + "/" + cfg.random_player[1]));
+		v[N_ASSIGN + 4] = cfg.debug_mode;   // (Debug mode: off, the game as ever from its start)
 		return v;
 	};
 	auto arcade_page = [&] {
 		if (!assign_before) assign_before = assignments_now();
-		menu_page p{ "Arcade settings: a change restarts the game when the menu closes", "", {} };   // always in view
-		auto choice = [&](const char *label, const char *help, ga a, std::function<std::string(int)> name) {
+		menu_page p{ tr::P_ARCADE, "", {} };   // always in view
+		auto choice = [&](tr::text label, tr::text help, ga a, std::function<std::string(int)> name) {
 			p.items.push_back({ label, help,
 				[&m, a, name] { int v = m.assignment(a); return v < 0 ? std::string("-") : name(v); },
 				[&m, a](int d) { int v = m.assignment(a); if (v >= 0) m.set_assignment(a, v + d); } });
 		};
-		static const char *DIFFICULTY[] = { "Easy", "Normal", "Hard", "Hardest" };
-		choice("Difficulty", "How hard the computer fights. Harder also gives both fighters less energy, and a smaller ring while Ring size is Default.",
-			ga::difficulty, [](int v) { return std::string(DIFFICULTY[v]); });
+		static const tr::text DIFFICULTY[] = { tr::A_EASY, tr::A_NORMAL, tr::A_HARD, tr::A_HARDEST };
+		choice(tr::A_DIFFICULTY, tr::A_DIFFICULTY_HELP, ga::difficulty, [](int v) { return std::string(DIFFICULTY[v]); });
 		static const int RINGS[] = { 0, 1300, 1400, 1500, 1600 };   // the arcade's widths (STAGE WIDTH)
-		static const char *RING_NAMES[] = { "Default", "Small", "Medium", "Large", "Extra large" };
-		p.items.push_back({ "Ring size",
-			"Default follows the difficulty, as on the arcade: Extra large on Easy, down to Small on Hardest. A smaller ring makes ring outs easier.",
+		static const tr::text RING_NAMES[] = { tr::A_RING_DEFAULT, tr::A_RING_SMALL, tr::A_RING_MEDIUM, tr::A_RING_LARGE, tr::A_RING_XL };
+		p.items.push_back({ tr::A_RING, tr::A_RING_HELP,
 			[&] { return std::string(RING_NAMES[std::find(std::begin(RINGS), std::end(RINGS), cfg.ring) - std::begin(RINGS)]); },
 			[&](int d) {
 				int i = int(std::find(std::begin(RINGS), std::end(RINGS), cfg.ring) - std::begin(RINGS));
@@ -3225,16 +3580,21 @@ int main(int argc, char **argv)
 				cfg_dirty = true;
 				m.set_ring_width(cfg.ring);
 			} });
-		choice("Rounds to win (vs CPU)", "Rounds needed to win a match against the computer.", ga::match_1p, [](int v) { return std::to_string(v); });
-		choice("Rounds to win (vs player)", "Rounds needed to win a match between two players. Online matches are always first to 3.", ga::match_vs, [](int v) { return std::to_string(v); });
-		choice("Continue", "Off ends the game when you lose to the computer.", ga::continues, [&](int v) { return on_off(v); });
-		choice("Demo sound", "Sound during the demo that plays between games.", ga::advertise_sound, [&](int v) { return on_off(v); });
-		choice("After a versus match", "Winner plays on: the winner carries on against the computer, as on the arcade. Both stop: the game ends for both players.",
-			ga::vs_finish, [](int v) { return std::string(v ? "Both stop" : "Winner plays on"); });
-		choice("Version", "The arcade's own choice between the original game and its Version 2.1 update.",
-			ga::version, [](int v) { return std::string(v ? "2.1" : "Original"); });
-		p.items.push_back({ "Service menu",
-			"The arcade's own test menu: input and sound tests, coin settings and bookkeeping. Down moves, Start selects (or 9 and F2 on a keyboard). Choose EXIT to come back.",
+		choice(tr::A_ROUNDS_CPU, tr::A_ROUNDS_CPU_HELP, ga::match_1p, [](int v) { return std::to_string(v); });
+		choice(tr::A_ROUNDS_VS, tr::A_ROUNDS_VS_HELP, ga::match_vs, [](int v) { return std::to_string(v); });
+		choice(tr::A_CONTINUE, tr::A_CONTINUE_HELP, ga::continues, [&](int v) { return on_off(v); });
+		choice(tr::A_DEMO_SOUND, tr::A_DEMO_SOUND_HELP, ga::advertise_sound, [&](int v) { return on_off(v); });
+		choice(tr::A_AFTER_VS, tr::A_AFTER_VS_HELP, ga::vs_finish, [](int v) { return std::string(v ? tr::A_BOTH_STOP : tr::A_WINNER_ON); });
+		choice(tr::A_VERSION, tr::A_VERSION_HELP, ga::version, [](int v) { return v ? std::string("2.1") : std::string(tr::A_ORIGINAL); });
+		// (Stage select, issue #33: offline only, an online match's board never; no restart, from the next Start)
+		p.items.push_back({ tr::A_STAGE_SELECT, tr::A_STAGE_SELECT_HELP,
+			[&] { return cfg.stage < 0 ? std::string(tr::OFF) : cfg.stage == vf2net::STAGES ? std::string(tr::A_STAGE_DURAL) : tr::fill(tr::A_STAGE_N, { { "n", std::to_string(cfg.stage + 1) } }); },
+			[&](int d) { const int v = std::clamp(cfg.stage + d, -1, vf2net::STAGES); cfg.stage = v == 0 ? (d > 0 ? 1 : -1) : v; cfg_dirty = true; } });   // (Stage 1 is Off's)
+		// (Debug mode: Cheats' before, settings.ini's debug_mode key as it was; offline only, never on a match's board)
+		p.items.push_back({ tr::A_DEBUG, tr::A_DEBUG_HELP,
+			[&] { return on_off(cfg.debug_mode); },
+			[&](int) { cfg.debug_mode = !cfg.debug_mode; cfg_dirty = true; } });   // (applied as the game restarts)
+		p.items.push_back({ tr::A_SERVICE, tr::A_SERVICE_HELP,
 			{}, {}, [&] { menu.close(); paused = false; g_test_pending = true; } });
 		p.items.push_back(back_item());
 		return p;
@@ -3242,31 +3602,29 @@ int main(int argc, char **argv)
 	// ---- cheats: each player's fighter (random fighters), Random opponents, the secret characters (in Akira's place) ----
 	// Each player's fighter's row state: typing a seed in it, what was typed, a mistake; and where the page put the
 	// rows (to make it again with the same one selected)
-	struct seed_entry { bool typing = false, pending = false; std::string typed, error; };   // (pending: Seed chosen, none typed yet: plays as Random)
+	struct seed_entry { bool typing = false, pending = false; std::string typed; tr::line error; };   // (pending: Seed chosen, none typed yet: plays as Random)
 	std::shared_ptr<seed_entry> seed_st[2] = { std::make_shared<seed_entry>(), std::make_shared<seed_entry>() };
 	int fighter_row[2] = { 0, 0 }, fighter_sub[2] = { -1, -1 };
 	std::function<menu_page()> cheats_page;
 	// (out here: the rows' functions outlive the page's making)
 	auto kind_of = [&](int pl) { const std::string &v = cfg.random_player[pl]; return v.empty() ? 0 : v == "*" ? 1 : 2; };
-	static const char *KINDS[] = { "Normal", "Random", "Seed" };
+	static const tr::text KINDS[] = { tr::FIGHTER_NORMAL, tr::FIGHTER_RANDOM, tr::FIGHTER_SEED };
 	auto rebuild = [&](int pl, bool sub) { menu_page pg = cheats_page(); menu.replace(std::move(pg), sub && fighter_sub[pl] >= 0 ? fighter_sub[pl] : fighter_row[pl]); };
 	cheats_page = [&] {
 		if (!assign_before) assign_before = assignments_now();
-		menu_page p{ "Cheats: a change restarts the game when the menu closes", "", {} };
-		auto heading = [&](const char *t) { menu_item h{ t, "", {}, {}, {}, true }; h.heading = true; p.items.push_back(h); };
-		heading("FIGHTERS");
+		menu_page p{ tr::P_CHEATS_PAGE, "", {} };
+		auto heading = [&](tr::text t) { menu_item h{ t, "", {}, {}, {}, true }; h.heading = true; p.items.push_back(h); };
+		heading(tr::C_FIGHTERS);
 		// Each player's fighter (Normal, Random, Seed), and under it, when it's Seed, a row of its own for the seed
 		// (typed right in it, a mistake said under it). Anything but Normal is picked for that player at the select
 		for (int pl = 0; pl < 2; pl++) {
 			auto st = seed_st[pl];
 			auto entry = std::make_shared<std::function<bool(const SDL_Event &)>>();
-			static const char *HINT = "Letters type   Backspace delete   Enter play it   Esc cancel   "
-									  "(a pad: Up / Down the letter, Right the next, Left delete, A play it, B cancel)";
 			auto set_kind = [&, pl](const std::string &v) { cfg.random_player[pl] = v; if (v != "" && v != "*") cfg.random_named[pl] = v; cfg_dirty = true; };
 			auto start_typing = [&, pl, st, entry] {
 				st->typing = true; st->typed.clear(); st->error.clear();
 				rebuild(pl, true);
-				menu.capture(HINT, *entry, [&, pl, st] { st->typing = false; st->error.clear(); rebuild(pl, false); });
+				menu.capture(tr::SEED_HINT, *entry, [&, pl, st] { st->typing = false; st->error.clear(); rebuild(pl, false); });
 			};
 			*entry = [&, pl, st, set_kind](const SDL_Event &e) {
 				bool enter = false;
@@ -3294,18 +3652,15 @@ int main(int argc, char **argv)
 					return false;
 				st->error.clear();
 				if (enter) {
-					if (st->typed.empty()) st->error = "Type a seed: a random fighter's name, from its energy bar";
-					else if (!m.random_fighter_names().count(st->typed)) st->error = "No fighter has the seed " + st->typed;
+					if (st->typed.empty()) st->error = tr::SEED_TYPE_ONE;
+					else if (!m.random_fighter_names().count(st->typed)) st->error = tr::line(tr::SEED_NONE, { { "seed", st->typed } });
 					else { set_kind(st->typed); st->typing = st->pending = false; rebuild(pl, true); return true; }
 				}
 				menu.refresh();
 				return false;
 			};
 			fighter_row[pl] = int(p.items.size());
-			p.items.push_back({ pl ? "Player 2 fighter" : "Player 1 fighter",
-				"Normal: pick at the select. Random: a new fighter every game, made of three of the cast: head, body and limbs "
-				"from the three, its moves dealt from them. Seed: one such fighter by its name, the same on any machine. Anything "
-				"but Normal is picked for you at the select (in MUE's and KOJAC's places: Secret character's MUE and KOJAC are off meanwhile).",
+			p.items.push_back({ pl ? tr::C_P2_FIGHTER : tr::C_P1_FIGHTER, tr::C_FIGHTER_HELP,
 				[&, pl, st] { return std::string(KINDS[st->typing || st->pending ? 2 : kind_of(pl)]); },
 				[&, pl, st, set_kind](int d) {
 					const int k = wrap((st->pending ? 2 : kind_of(pl)) + d, 3);
@@ -3321,25 +3676,22 @@ int main(int argc, char **argv)
 			fighter_sub[pl] = -1;
 			if ((st->typing || st->pending ? 2 : kind_of(pl)) == 2) {
 				fighter_sub[pl] = int(p.items.size());
-				menu_item it{ "Seed",
-					"A random fighter's name, from its energy bar: the same seed is the same fighter, looks and moves, on any machine. Enter: type a new one.",
-					[&, pl, st] { return st->typing ? st->typed + "_" : st->pending ? std::string("Enter to type a seed (Random till then)") : cfg.random_player[pl]; },
+				menu_item it{ tr::FIGHTER_SEED, tr::C_SEED_HELP,
+					[&, pl, st] { return st->typing ? st->typed + "_" : st->pending ? std::string(tr::SEED_PENDING) : cfg.random_player[pl]; },
 					{}, start_typing };
-				it.below = [st] { return st->typing ? st->error : std::string(); };
+				it.below = [st] { return st->typing ? st->error.str() : std::string(); };
 				it.sub = true;
 				p.items.push_back(it);
 			}
 		}
-		p.items.push_back({ "Random opponents",
-			"Every computer opponent a random fighter, looks and moves, made afresh for each match (not one you're playing as).",
+		p.items.push_back({ tr::C_RANDOM_CPU, tr::C_RANDOM_CPU_HELP,
 			[&] { return on_off(cfg.random_cpu); },
 			[&](int) { cfg.random_cpu = !cfg.random_cpu; cfg_dirty = true; } });   // (applied as the game restarts)
-		heading("SECRET CHARACTERS");
+		heading(tr::C_SECRET_HEAD);
 		static const int SECRET[] = { 0, 9, 11, 12 };
-		static const char *SECRET_NAMES[] = { "Off", "Dural", "MUE", "KOJAC" };
-		p.items.push_back({ "Secret character",
-			"Puts a fighter the arcade never let you pick in Akira's spot on the player select, for either player: Dural, the final boss, or MUE and KOJAC, two unused fighters left in the game (Lion's body with Akira's moves, from its debug menu). The select shows their portrait with Akira's name and profile. MUE and KOJAC are off while a player's fighter is Random or Seed.",
-			[&] { return std::string(SECRET_NAMES[std::find(std::begin(SECRET), std::end(SECRET), cfg.secret) - std::begin(SECRET)]); },
+		static const char *SECRET_NAMES[] = { "Off", "Dural", "MUE", "KOJAC" };   // (the fighters' names as they are; Off the language's)
+		p.items.push_back({ tr::C_SECRET, tr::C_SECRET_HELP,
+			[&] { const auto i = std::find(std::begin(SECRET), std::end(SECRET), cfg.secret) - std::begin(SECRET); return i ? std::string(SECRET_NAMES[i]) : std::string(tr::OFF); },
 			[&](int d) {
 				const int i = int(std::find(std::begin(SECRET), std::end(SECRET), cfg.secret) - std::begin(SECRET));
 				const int n = int(std::size(SECRET));
@@ -3350,18 +3702,36 @@ int main(int argc, char **argv)
 		return p;
 	};
 	// ---- controls: per player, keys and pad buttons, and which pad ----
+	// The controls' names in the language on (CONTROL_NAMES: the log's and the settings' English), and a pad button's
+	auto control_name = [](int a) -> std::string {
+		static const tr::text names[C_COUNT] = { tr::CTL_UP, tr::CTL_DOWN, tr::CTL_LEFT, tr::CTL_RIGHT, tr::CTL_GUARD, tr::CTL_PUNCH, tr::CTL_KICK,
+			tr::CTL_GUARD_PUNCH, tr::CTL_PUNCH_KICK, tr::CTL_GUARD_KICK, tr::CTL_ALL_THREE, tr::CTL_START, tr::CTL_COIN, tr::CTL_MENU };
+		return a >= 0 && a < C_COUNT ? std::string(names[a]) : std::string();
+	};
+	auto pad_label = [](int code) -> std::string {   // (the buttons' printed names as they are: A, B, LB, Start, View)
+		switch (code) {
+		case SDL_GAMEPAD_BUTTON_LEFT_STICK: return tr::PAD_LEFT_STICK;
+		case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return tr::PAD_RIGHT_STICK;
+		case SDL_GAMEPAD_BUTTON_TOUCHPAD: return tr::PAD_TOUCHPAD;
+		case SDL_GAMEPAD_BUTTON_DPAD_UP: return tr::PAD_DPAD_UP;
+		case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return tr::PAD_DPAD_DOWN;
+		case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return tr::PAD_DPAD_LEFT;
+		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return tr::PAD_DPAD_RIGHT;
+		default: return player_controls::pad_label(code);
+		}
+	};
 	auto key_name = [](SDL_Scancode k) {
 		if (!k) return std::string("-");
-		const char *n = SDL_GetScancodeName(k);
-		return n && *n ? std::string(n) : "Key " + std::to_string(int(k));
+		const char *n = SDL_GetScancodeName(k);   // (the keys' own names, as they're printed: not translated)
+		return n && *n ? std::string(n) : tr::fill(tr::CTL_KEY_N, { { "n", std::to_string(int(k)) } });
 	};
 	auto pad_name = [&](int p) {
 		const std::string &c = cfg.ctl[p].pad_choice;
 		const char *nm = pads[p] ? SDL_GetGamepadName(pads[p]) : nullptr;
-		std::string now = pads[p] ? (nm && *nm ? nm : "Gamepad") : "";
-		if (c == "none") return std::string("None");
-		if (c == "auto") return now.empty() ? std::string("Any pad (none connected)") : "Any pad: " + now;
-		return now.empty() ? std::string("Chosen pad (not connected)") : now;
+		std::string now = pads[p] ? (nm && *nm ? nm : tr::CTL_GAMEPAD.c_str()) : "";
+		if (c == "none") return std::string(tr::CTL_NONE);
+		if (c == "auto") return now.empty() ? std::string(tr::CTL_ANY_PAD_NONE) : tr::fill(tr::CTL_ANY_PAD, { { "pad", now } });
+		return now.empty() ? std::string(tr::CTL_CHOSEN_PAD_GONE) : now;
 	};
 	// the pad choices: any free pad, each connected pad, none
 	auto cycle_pad = [&](int p, int d) {
@@ -3380,17 +3750,17 @@ int main(int argc, char **argv)
 		cfg_dirty = true;
 		open_pads();
 	};
-	auto keys_page = [&](int p) {
-		menu_page pg{ p ? "Player 2 keyboard" : "Player 1 keyboard", "", {} };
+	// (slot 0 a control's key or button, 1 its second: Controls > Second keys, Second pad buttons)
+	auto key_of = [&](int p, int slot, int a) -> SDL_Scancode & { return slot ? cfg.ctl[p].key2[a] : cfg.ctl[p].key[a]; };
+	auto pad_of = [&](int p, int slot, int a) -> int & { return slot ? cfg.ctl[p].pad2[a] : cfg.ctl[p].pad[a]; };
+	auto keys_page = [&](int p, int slot) {
+		menu_page pg{ slot ? (p ? tr::P_P2_KEYBOARD2 : tr::P_P1_KEYBOARD2) : (p ? tr::P_P2_KEYBOARD : tr::P_P1_KEYBOARD), "", {} };
 		for (int a = 0; a < C_COUNT; a++)
-			pg.items.push_back({ CONTROL_NAMES[a], std::string(a == C_COIN ? "A coin for this player in Arcade mode (a cabinet's coin slot). "
-													: a == C_MENU ? "Opens this menu (as Esc always does): for a cabinet's button. " : "") +
-					"Select, then press the key to use. Delete clears it.",
-				[&, p, a] { return key_name(cfg.ctl[p].key[a]); }, {},
-				[&, p, a] {
-					menu.capture(std::string("Press a key for ") + CONTROL_NAMES[a] + (p ? " (player 2)" : " (player 1)") +
-								 ". Backspace or Delete clears it, Esc keeps it.",
-						[&, p, a](const SDL_Event &e) {
+			pg.items.push_back({ control_name(a), a == C_COIN ? tr::CTL_KEY_HELP_COIN : a == C_MENU ? tr::CTL_KEY_HELP_MENU : tr::CTL_KEY_HELP,
+				[&, p, slot, a] { return key_name(key_of(p, slot, a)); }, {},
+				[&, p, slot, a] {
+					menu.capture(tr::fill(p ? tr::CTL_PRESS_KEY_P2 : tr::CTL_PRESS_KEY_P1, { { "control", control_name(a) } }),
+						[&, p, slot, a](const SDL_Event &e) {
 							if (e.type != SDL_EVENT_KEY_DOWN) return false;
 							const SDL_Scancode k = e.key.scancode == SDL_SCANCODE_BACKSPACE || e.key.scancode == SDL_SCANCODE_DELETE ? SDL_SCANCODE_UNKNOWN : e.key.scancode;
 							// the game's own keys (pause, reset, the menu's shortcuts, the cabinet's coin and
@@ -3400,48 +3770,44 @@ int main(int argc, char **argv)
 							for (SDL_Scancode r : RESERVED) if (k == r) return false;
 							for (const auto &sk : SYS_KEYS) if (k == sk.key) return false;
 							// a key does one thing: take it off whatever had it
-							if (k) for (auto &c : cfg.ctl) for (auto &x : c.key) if (x == k) x = SDL_SCANCODE_UNKNOWN;
-							cfg.ctl[p].key[a] = k;
+							if (k) for (auto &c : cfg.ctl) { for (auto &x : c.key) if (x == k) x = SDL_SCANCODE_UNKNOWN; for (auto &x : c.key2) if (x == k) x = SDL_SCANCODE_UNKNOWN; }   // (first or second)
+							key_of(p, slot, a) = k;
 							cfg_dirty = true;
 							return true;
 						});
-				}, false, [&, p, a] { cfg.ctl[p].key[a] = SDL_SCANCODE_UNKNOWN; cfg_dirty = true; } });
+				}, false, [&, p, slot, a] { key_of(p, slot, a) = SDL_SCANCODE_UNKNOWN; cfg_dirty = true; } });
 		pg.items.push_back(back_item());
 		return pg;
 	};
-	auto pad_buttons_page = [&](int p) {
-		menu_page pg{ p ? "Player 2 pad buttons" : "Player 1 pad buttons", "", {} };
+	auto pad_buttons_page = [&](int p, int slot) {
+		menu_page pg{ slot ? (p ? tr::P_P2_PAD2 : tr::P_P1_PAD2) : (p ? tr::P_P2_PAD : tr::P_P1_PAD), "", {} };
 		for (int a = C_GUARD; a < C_COUNT; a++)
-			pg.items.push_back({ CONTROL_NAMES[a], std::string(a == C_COIN ? "A coin for this player in Arcade mode (a cabinet's coin slot). "
-												   : a == C_MENU ? "Opens this menu. L3 + R3 and the touchpad click (when it isn't set to something else) always do too, and Esc on a keyboard. " : "") +
-												   "Select, then press the button (or trigger) to use. Y (or Delete) clears it. "
-												   "The d-pad and left stick always move.",
-				[&, p, a] { return player_controls::pad_label(cfg.ctl[p].pad[a]); }, {},
-				[&, p, a] {
-					menu.capture(std::string("Press a pad button for ") + CONTROL_NAMES[a] + (p ? " (player 2)" : " (player 1)") +
-								 (a >= C_COIN ? ". Esc keeps it; Delete clears it." : ". View or Esc keeps it; Delete clears it."),
-						[&, p, a](const SDL_Event &e) {
+			pg.items.push_back({ control_name(a), a == C_COIN ? tr::CTL_PADB_HELP_COIN : a == C_MENU ? tr::CTL_PADB_HELP_MENU : tr::CTL_PADB_HELP,
+				[&, p, slot, a] { return pad_label(pad_of(p, slot, a)); }, {},
+				[&, p, slot, a] {
+					menu.capture(tr::fill(a >= C_COIN && !slot ? (p ? tr::CTL_PRESS_PAD_P2 : tr::CTL_PRESS_PAD_P1) : (p ? tr::CTL_PRESS_PAD_VIEW_P2 : tr::CTL_PRESS_PAD_VIEW_P1), { { "control", control_name(a) } }),
+						[&, p, slot, a](const SDL_Event &e) {
 							int code = PAD_NONE;
 							if (e.type == SDL_EVENT_KEY_DOWN) {
 								if (e.key.scancode != SDL_SCANCODE_DELETE && e.key.scancode != SDL_SCANCODE_BACKSPACE) return false;
-								cfg.ctl[p].pad[a] = PAD_NONE;
+								pad_of(p, slot, a) = PAD_NONE;
 								cfg_dirty = true;
 								return true;
 							}
 							if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
 								// View: keep it (View is for the menu's hotkeys, not moves), unless it's for Coin or Menu
-								if (e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK && a < C_COIN) return true;
+								if (e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK && (a < C_COIN || slot)) return true;   // (a second button never takes View)
 								code = e.gbutton.button;
 							} else if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && e.gaxis.value > 16000 &&
 									   (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER))
 								code = e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ? PAD_LT : PAD_RT;
 							else return false;
-							for (int b = C_GUARD; b < C_COUNT; b++) if (cfg.ctl[p].pad[b] == code) cfg.ctl[p].pad[b] = PAD_NONE;
-							cfg.ctl[p].pad[a] = code;
+							for (int b = C_GUARD; b < C_COUNT; b++) { if (cfg.ctl[p].pad[b] == code) cfg.ctl[p].pad[b] = PAD_NONE; if (cfg.ctl[p].pad2[b] == code) cfg.ctl[p].pad2[b] = PAD_NONE; }   // (first or second)
+							pad_of(p, slot, a) = code;
 							cfg_dirty = true;
 							return true;
 						});
-				}, false, [&, p, a] { cfg.ctl[p].pad[a] = PAD_NONE; cfg_dirty = true; } });
+				}, false, [&, p, slot, a] { pad_of(p, slot, a) = PAD_NONE; cfg_dirty = true; } });
 		pg.items.push_back(back_item());
 		return pg;
 	};
@@ -3479,8 +3845,10 @@ int main(int argc, char **argv)
 	};
 	auto setup_prompt = [&] {
 		const int p = setup.player;
-		menu.capture(std::string("Press ") + SETUP_STEPS[setup.step].name + " on the pad (player " + std::to_string(p + 1) + ", " +
-					 std::to_string(setup.step + 1) + " of " + std::to_string(N_SETUP) + "). Delete skips it, Esc stops.",
+		static const tr::text SETUP_NAMES[] = { tr::CTL_UP, tr::CTL_DOWN, tr::CTL_LEFT, tr::CTL_RIGHT, tr::CTL_GUARD, tr::CTL_PUNCH, tr::CTL_KICK,
+			tr::CTL_START, tr::SETUP_MENU_STEP };
+		static_assert(sizeof SETUP_NAMES / sizeof SETUP_NAMES[0] == N_SETUP, "a name for each of SETUP_STEPS");
+		menu.capture(tr::fill(tr::SETUP_PRESS, { { "button", SETUP_NAMES[setup.step] }, { "player", std::to_string(p + 1) }, { "n", std::to_string(setup.step + 1) }, { "of", std::to_string(N_SETUP) } }),
 			[&](const SDL_Event &e) {   // (the pad's own events are swallowed meanwhile: what counts is read below)
 				if (e.type == SDL_EVENT_KEY_DOWN && (e.key.scancode == SDL_SCANCODE_DELETE || e.key.scancode == SDL_SCANCODE_BACKSPACE)) setup.skip = true;
 				return false;
@@ -3488,10 +3856,10 @@ int main(int argc, char **argv)
 			[&] { setup_end(); fprintf(stderr, "set up buttons: stopped\n"); });
 	};
 	auto setup_start = [&](int p) {
-		if (!pads[p]) { menu.toast("No pad for this player: connect one, or choose it in Pad, first."); return; }
+		if (!pads[p]) { menu.toast(tr::SETUP_NO_PAD); return; }
 		setup_end();
 		setup.joy = SDL_OpenJoystick(SDL_GetGamepadID(pads[p]));   // (a reference of its own: pads are opened again as they come and go)
-		if (!setup.joy) { menu.toast("That pad can't be read as it is."); return; }
+		if (!setup.joy) { menu.toast(tr::SETUP_UNREADABLE); return; }
 		setup.player = p;
 		setup.step = 0;
 		setup.wait_release = true;
@@ -3560,7 +3928,7 @@ int main(int argc, char **argv)
 		if (now) SDL_free(now);
 		if (!taken) {
 			fprintf(stderr, "set up buttons: the mapping wasn't taken (%s): %s\n", added < 0 ? SDL_GetError() : "another, from Steam or SDL_GAMECONTROLLERCONFIG, decides", m.c_str());
-			menu.toast(added < 0 ? "The buttons couldn't be set up." : "Steam's controller settings decide this pad's buttons: set them up in Steam instead.");
+			menu.toast(added < 0 ? tr::SETUP_FAILED : tr::SETUP_STEAM);
 			return;
 		}
 		fprintf(stderr, "set up buttons: %s\n", m.c_str());
@@ -3575,14 +3943,15 @@ int main(int argc, char **argv)
 			for (int i = SETUP_FIRST_BUTTON; i <= SETUP_START && i < int(setup.got.size()); i++) {
 				if (setup.got[i].empty()) continue;
 				const int code = CODE[i - SETUP_FIRST_BUTTON];
-				for (int b = C_GUARD; b < C_COUNT; b++) if (cfg.ctl[q].pad[b] == code) cfg.ctl[q].pad[b] = PAD_NONE;
+				for (int b = C_GUARD; b < C_COUNT; b++) { if (cfg.ctl[q].pad[b] == code) cfg.ctl[q].pad[b] = PAD_NONE; if (cfg.ctl[q].pad2[b] == code) cfg.ctl[q].pad2[b] = PAD_NONE; }
 				cfg.ctl[q].pad[SETUP_STEPS[i].action] = code;
 			}
 		}
 		cfg_dirty = true;
 		menu.refresh();
-		menu.toast(std::string("Player ") + std::to_string(p + 1) + "'s buttons are set up" +
-		           (pads[1 - p] && joystick_guid(SDL_GetGamepadID(pads[1 - p])) == guid ? " (and player " + std::to_string(2 - p) + "'s, the same kind of pad)." : "."));
+		menu.toast(pads[1 - p] && joystick_guid(SDL_GetGamepadID(pads[1 - p])) == guid
+		           ? tr::fill(tr::SETUP_DONE_BOTH, { { "player", std::to_string(p + 1) }, { "other", std::to_string(2 - p) } })
+		           : tr::fill(tr::SETUP_DONE, { { "player", std::to_string(p + 1) } }));
 	};
 	// each pass of the loop while it's on: the joystick's state read (SDL updates it as the events are polled)
 	auto setup_poll = [&] {
@@ -3591,7 +3960,7 @@ int main(int argc, char **argv)
 		if (!menu.capturing() || !SDL_JoystickConnected(j)) {
 			const bool gone = menu.capturing();
 			setup_end();
-			if (gone) { menu.end_capture(); menu.toast("The pad was disconnected."); }
+			if (gone) { menu.end_capture(); menu.toast(tr::SETUP_DISCONNECTED); }
 			return;
 		}
 		const int nb = SDL_GetNumJoystickButtons(j), nh = SDL_GetNumJoystickHats(j), na = std::min(SDL_GetNumJoystickAxes(j), int(setup.rest.size()));
@@ -3617,7 +3986,7 @@ int main(int argc, char **argv)
 			else if (now - setup.since > 10000) {   // (a switch that reads as held, or an axis off its rest: never let go)
 				setup_end();
 				menu.end_capture();
-				menu.toast("Setting up the buttons stopped: something on the pad stays pressed (a turbo or mode switch?).");
+				menu.toast(tr::SETUP_HELD);
 				fprintf(stderr, "set up buttons: something held for 10 s\n");
 			}
 			return;
@@ -3635,7 +4004,7 @@ int main(int argc, char **argv)
 				}
 				setup_end();
 				menu.end_capture();
-				menu.toast("Setting up the buttons stopped: nothing was pressed for 10 seconds.");
+				menu.toast(tr::SETUP_TIMEOUT);
 				fprintf(stderr, "set up buttons: nothing pressed for 10 s\n");
 			}
 			return;
@@ -3648,30 +4017,32 @@ int main(int argc, char **argv)
 		else setup_prompt();
 	};
 	auto player_page = [&](int p) {
-		menu_page pg{ p ? "Player 2" : "Player 1", "", {} };
-		pg.items.push_back({ "Pad", "Which controller this player uses: any free one, a particular one, or none.",
+		menu_page pg{ p ? tr::P_PLAYER_2 : tr::P_PLAYER_1, "", {} };
+		pg.items.push_back({ tr::CTL_PAD, tr::CTL_PAD_HELP,
 							 [&, p] { return pad_name(p); }, [&, p](int d) { cycle_pad(p, d); } });
-		pg.items.push_back({ "Keyboard", "Change this player's keys.", {}, {}, [&, p] { menu.push(keys_page(p)); } });
-		pg.items.push_back({ "Pad buttons", "Change which buttons guard, punch, kick, do the combinations, start, add a coin and open the menu.",
-							 {}, {}, [&, p] { menu.push(pad_buttons_page(p)); } });
-		pg.items.push_back({ "Set up buttons", "For an arcade stick, or a pad whose directions or buttons come out wrong: press each direction and "
-							 "button on it when asked, and it works that way from then on. Delete skips one it doesn't have; Esc stops.",
+		pg.items.push_back({ tr::CTL_KEYBOARD, tr::CTL_KEYBOARD_HELP, {}, {}, [&, p] { menu.push(keys_page(p, 0)); } });
+		pg.items.push_back({ tr::CTL_KEYBOARD2, tr::CTL_KEYBOARD2_HELP, {}, {}, [&, p] { menu.push(keys_page(p, 1)); } });
+		pg.items.push_back({ tr::CTL_PAD_BUTTONS, tr::CTL_PAD_BUTTONS_HELP,
+							 {}, {}, [&, p] { menu.push(pad_buttons_page(p, 0)); } });
+		pg.items.push_back({ tr::CTL_PAD_BUTTONS2, tr::CTL_PAD_BUTTONS2_HELP,
+							 {}, {}, [&, p] { menu.push(pad_buttons_page(p, 1)); } });
+		pg.items.push_back({ tr::CTL_SETUP, tr::CTL_SETUP_HELP,
 							 {}, {}, [&, p] { setup_start(p); } });
-		pg.items.push_back({ "Reset to defaults", "Put this player's keys and buttons back as they were, and forget the buttons set up for the pad connected now (from the next start).", {}, {},
+		pg.items.push_back({ tr::CTL_RESET, tr::CTL_RESET_HELP, {}, {},
 							 [&, p] {
 								 // (a pad's set-up buttons forgotten: SDL keeps a mapping for the run, so its own is back next start)
 								 // (not while the other player's pad is the same kind: the mapping's theirs too)
 								 if (pads[p]) {
 									 const std::string g = joystick_guid(SDL_GetGamepadID(pads[p]));
 									 if (pads[1 - p] && joystick_guid(SDL_GetGamepadID(pads[1 - p])) == g)
-										 menu.toast("The other player's pad is the same kind, so its set-up buttons stay.");
+										 menu.toast(tr::CTL_RESET_SAME_KIND);
 									 else if (forget_mapping(g))
-										 menu.toast("The pad's set-up buttons are forgotten: its own come back when the game starts again.");
+										 menu.toast(tr::CTL_RESET_FORGOTTEN);
 								 }
 								 cfg.ctl[p] = player_controls::defaults(p);
 								 // the default keys may be the other player's now: take them off there
 								 for (auto k : cfg.ctl[p].key)
-									 if (k) for (auto &x : cfg.ctl[1 - p].key) if (x == k) x = SDL_SCANCODE_UNKNOWN;
+									 if (k) { for (auto &x : cfg.ctl[1 - p].key) if (x == k) x = SDL_SCANCODE_UNKNOWN; for (auto &x : cfg.ctl[1 - p].key2) if (x == k) x = SDL_SCANCODE_UNKNOWN; }
 								 cfg_dirty = true;
 								 open_pads();
 							 } });
@@ -3679,12 +4050,12 @@ int main(int argc, char **argv)
 		return pg;
 	};
 	auto controls_page = [&] {
-		menu_page pg{ "Controls", "", {} };
-		pg.items.push_back({ "Player 1", "Player 1's controller, keys and buttons.", [&] { return pad_name(0); }, {},
+		menu_page pg{ tr::P_CONTROLS, "", {} };
+		pg.items.push_back({ tr::P_PLAYER_1, tr::CTL_P1_HELP, [&] { return pad_name(0); }, {},
 							 [&] { menu.push(player_page(0)); } });
-		pg.items.push_back({ "Player 2", "Player 2's controller, keys and buttons.", [&] { return pad_name(1); }, {},
+		pg.items.push_back({ tr::P_PLAYER_2, tr::CTL_P2_HELP, [&] { return pad_name(1); }, {},
 							 [&] { menu.push(player_page(1)); } });
-		pg.items.push_back({ "Swap pads", "Player 1 and player 2 swap controllers.", {}, {},
+		pg.items.push_back({ tr::CTL_SWAP, tr::CTL_SWAP_HELP, {}, {},
 							 [&] {
 								 auto choice = [&](int p) { return pads[p] ? guid_of(SDL_GetGamepadID(pads[p])) : std::string("none"); };
 								 std::string a = choice(0), b = choice(1);
@@ -3720,13 +4091,42 @@ int main(int argc, char **argv)
 		std::vector<uint8_t> in;
 		std::atomic<bool> quit{ false };
 		std::atomic<uint64_t> frames{ 0 }, bytes_in{ 0 };   // (the log's: what it played)
-		void put(const std::vector<uint8_t> &b) { std::lock_guard<std::mutex> lk(mx); in.insert(in.end(), b.begin(), b.end()); bytes_in += b.size(); }
+		// (a watcher's frames caught up unseen, for the board to run through unheard as fast as it can, in time while it
+		// keeps up (vf2net::UnheardQueue, bounded): after in's first unheard_at bytes; while there are some, put's go
+		// after them (heard), so the bytes keep their order)
+		vf2net::UnheardQueue unheard = [] { vf2net::UnheardQueue q; q.most_timed = vf2net::UNHEARD_CATCH_UP; return q; }();   // (none let go catching up: vf2_netplay.h)
+		size_t unheard_at = 0;
+		std::atomic<bool> unheard_on{ false };
+		// (a watcher catching up, unseen: the board runs through what it's given unheard, and nothing more, not on to the
+		// real clock meanwhile; heard again at the live point, from where those frames left it: Online::watch_hushed)
+		std::atomic<bool> held{ false };
+		void put(const std::vector<uint8_t> &b)
+		{
+			std::lock_guard<std::mutex> lk(mx);
+			if (unheard_on) unheard.heard(b);
+			else in.insert(in.end(), b.begin(), b.end());
+			bytes_in += b.size();
+		}
+		void put_unheard(const std::vector<uint8_t> &b)
+		{
+			if (!th.joinable()) return;   // (no board playing: none to run them through)
+			std::lock_guard<std::mutex> lk(mx);
+			if (!unheard_on) unheard_at = in.size();
+			unheard.frame(b);
+			unheard_on = true;
+		}
+		size_t unheard_waiting()   // (frames caught up the board has still to run through: the catch-up waits past UNHEARD_AHEAD)
+		{
+			if (!th.joinable()) return 0;
+			std::lock_guard<std::mutex> lk(mx);
+			return unheard.frames();
+		}
 		void stop()
 		{
 			if (th.joinable()) {
 				quit = true;
 				th.join();
-				fprintf(stderr, "online: the match's sound board played %llu frames, %llu bytes from the game\n", (unsigned long long)frames.load(), (unsigned long long)bytes_in.load());
+				fprintf(stderr, "online: the match's sound board played %llu frames, %llu bytes from the game; %llu frames caught up let go\n", (unsigned long long)frames.load(), (unsigned long long)bytes_in.load(), (unsigned long long)unheard.dropped);
 			}
 			quit = false;
 			frames = bytes_in = 0;
@@ -3746,7 +4146,7 @@ int main(int argc, char **argv)
 		b.set_byte_link(true);
 		g_match_volumes = pack_volumes(cfg.volume, cfg.music, cfg.effects);
 		b.reset();
-		{ std::lock_guard<std::mutex> lk(msound.mx); msound.in.clear(); }
+		{ std::lock_guard<std::mutex> lk(msound.mx); msound.in.clear(); msound.unheard.clear(); msound.unheard_on = false; }
 		SDL_ClearAudioStream(audio);
 		const int target = int(frame_bytes * QUEUED);
 		msound.th = std::thread([&, target, bp, boot = online.adapter.boot_sound] {
@@ -3771,6 +4171,20 @@ int main(int argc, char **argv)
 				b.m_audio_out.clear();
 			}
 			while (!msound.quit) {
+				if (msound.unheard_on) {   // (a watcher's frames caught up unseen: run through unheard, the bytes put before them first)
+					vf2net::UnheardQueue::Piece piece;
+					{
+						std::lock_guard<std::mutex> lk(msound.mx);
+						const size_t at = std::min(msound.unheard_at, msound.in.size());
+						b.sound_bytes(msound.in.data(), at);
+						msound.in.erase(msound.in.begin(), msound.in.begin() + ptrdiff_t(at));
+						msound.unheard_at = 0;
+						if (!msound.unheard.next(piece)) { msound.unheard_on = false; continue; }
+					}
+					vf2net::run_unheard(b, piece);
+					continue;
+				}
+				if (msound.held) { SDL_DelayNS(1000000); continue; }   // (catching up: no sound to the real clock, none sped up)
 				if (SDL_GetAudioStreamQueued(audio) >= target) { SDL_DelayNS(1000000); continue; }
 				{ std::lock_guard<std::mutex> lk(msound.mx); bytes.swap(msound.in); }
 				take_volumes();
@@ -3807,6 +4221,12 @@ int main(int argc, char **argv)
 		g_test_frames = 0;
 	};
 	online.adapter.sound_out = [&](const std::vector<uint8_t> &b) { msound.put(b); };
+	// (a watcher's: its sound board started as its first frame runs, not at its first picture, so the frames it catches
+	// up unseen run through it unheard, in time (Adapter::sound_unheard): the stage's music on when the picture's up)
+	bool watch_sound_started = false;
+	online.adapter.sound_begin = [&] { match_sound_start(); watch_sound_started = true; };
+	online.adapter.sound_unheard = [&](const std::vector<uint8_t> &b) { msound.put_unheard(b); };
+	online.adapter.sound_unheard_waiting = [&] { return msound.unheard_waiting(); };
 	// The identity for the handshake: the online version, with vf2net::RANDOM_TAG after it for a random fighter (Online >
 	// Settings > Your fighter Random or Seed: such players meet only each other); Normal the plain version, as v0.1.16's
 	bool online_ready = false;   // (made: again after Your fighter changes between Normal and a random fighter)
@@ -3829,28 +4249,28 @@ int main(int argc, char **argv)
 			if (cfg.online.fighter.empty() == vf2net::random_version(online.identity.build)) { online_ready = false; online_identity(); }   // (Your fighter: at once)
 		});
 	};
+	int online_at = 5;   // (the main page's Online row, as main_page last made it: where a match's end opens the Online page)
+	auto online_row = [&] { return online_at; };
 	auto main_page = [&] {
 		menu_page p{ "", "", {} };
 		if (online.playing() || g_match_board) {   // (the match goes on under the menu; or it's starting, on its board)
-			p.items.push_back({ "Resume", "Back to the match (it goes on while the menu's open).", {}, {}, [&] { menu.close(); } });
+			p.items.push_back({ tr::M_RESUME, tr::M_RESUME_MATCH_HELP, {}, {}, [&] { menu.close(); } });
 			online_menu::match_rows(online, cfg.online, menu, [&] { cfg_dirty = true; }, p.items);
-			p.items.push_back({ "Display", "Sharpness, antialiasing, screen shape, background and screen filters, frame rate and fullscreen.",
-								{}, {}, [&] { menu.push(display_page()); } });
-			p.items.push_back({ "Sound", "The overall, music and effects volumes.", {}, {}, [&] { menu.push(sound_page()); } });
-			p.items.push_back({ "Controls", "Each player's controller, keys and buttons. Online, either player's controls play your fighter.", {}, {}, [&] { menu.push(controls_page()); } });
+			p.items.push_back({ tr::P_DISPLAY, tr::M_DISPLAY_HELP, {}, {}, [&] { menu.push(display_page()); } });
+			p.items.push_back({ tr::P_SOUND, tr::M_SOUND_HELP, {}, {}, [&] { menu.push(sound_page()); } });
+			p.items.push_back({ tr::P_CONTROLS, tr::M_CONTROLS_MATCH_HELP, {}, {}, [&] { menu.push(controls_page()); } });
 			return p;
 		}
-		p.items.push_back({ "Resume", "Back to the game.", {}, {}, [&] { menu.close(); } });
-		p.items.push_back({ "Display", "Sharpness, antialiasing, screen shape, background and screen filters, frame rate and fullscreen.",
-							{}, {}, [&] { menu.push(display_page()); } });
-		p.items.push_back({ "Sound", "The overall, music and effects volumes.", {}, {}, [&] { menu.push(sound_page()); } });
-		p.items.push_back({ "Game", "Play style and reset.", {}, {}, [&] { menu.push(game_page()); } });
-		p.items.push_back({ "Arcade settings", "Difficulty, ring size, rounds, continues and the service menu. Changing them restarts the game.", {}, {},
-							[&] { menu.push(arcade_page()); } });
-		p.items.push_back({ "Online", "Play someone over the network: a random opponent, or a friend with a room code.", {}, {}, [&] { menu.push(online_page()); } });
-		p.items.push_back({ "Controls", "Each player's controller, keys and buttons.", {}, {}, [&] { menu.push(controls_page()); } });
-		p.items.push_back({ "Cheats", "Random fighters (three of the cast made one, for you or every computer opponent), or play as Dural, MUE or KOJAC, unused fighters left in the game. Changing them restarts the game.", {}, {}, [&] { menu.push(cheats_page()); } });
-		p.items.push_back({ "Quit", "Saves and closes the game.", {}, {}, [&] { running = false; } });
+		p.items.push_back({ tr::M_RESUME, tr::M_RESUME_HELP, {}, {}, [&] { menu.close(); } });
+		p.items.push_back({ tr::P_DISPLAY, tr::M_DISPLAY_HELP, {}, {}, [&] { menu.push(display_page()); } });
+		p.items.push_back({ tr::P_SOUND, tr::M_SOUND_HELP, {}, {}, [&] { menu.push(sound_page()); } });
+		p.items.push_back({ tr::P_GAME, tr::M_GAME_HELP, {}, {}, [&] { menu.push(game_page()); } });
+		p.items.push_back({ tr::M_ARCADE, tr::M_ARCADE_HELP, {}, {}, [&] { menu.push(arcade_page()); } });
+		online_at = int(p.items.size());
+		p.items.push_back({ tr::P_ONLINE, tr::M_ONLINE_HELP, {}, {}, [&] { menu.push(online_page()); } });
+		p.items.push_back({ tr::P_CONTROLS, tr::M_CONTROLS_HELP, {}, {}, [&] { menu.push(controls_page()); } });
+		p.items.push_back({ tr::P_CHEATS, tr::M_CHEATS_HELP, {}, {}, [&] { menu.push(cheats_page()); } });
+		p.items.push_back({ tr::M_QUIT, tr::M_QUIT_HELP, {}, {}, [&] { running = false; } });
 		return p;
 	};
 	// the menu pauses the game and its sound: however it opened (Esc, the pad's View, the frames'
@@ -3866,10 +4286,22 @@ int main(int argc, char **argv)
 		sound_paused = pause;
 		if (sound_paused) SDL_PauseAudioStreamDevice(audio); else SDL_ResumeAudioStreamDevice(audio);
 	};
+	auto menu_title = [&] { return std::string(online.watching() ? tr::TITLE_WATCHING : online.playing() ? tr::TITLE_ONLINE_MATCH : tr::TITLE_PAUSED); };
+	menus_relabelled = [&] {   // (Game > Language changed: the title, the main page and Game made again in it, Language selected)
+		const int row = menu.selected();
+		menu.set_title(menu_title());
+		menu_page root = main_page();
+		int game_row = 0;
+		for (size_t i = 0; i < root.items.size(); i++) if (root.items[i].label == tr::P_GAME.c_str()) game_row = int(i);
+		menu.open(std::move(root));
+		menu.select_row(game_row);
+		menu.push(game_page());
+		menu.select_row(row);
+	};
 	auto open_menu = [&] {
 		touch.release();
 		finish_async(false);
-		menu.set_title(online.playing() ? "ONLINE MATCH" : "PAUSED");
+		menu.set_title(menu_title());
 		if (menu.ready() && !menu.is_open()) menu.open(main_page());
 		sync_menu_sound();
 	};
@@ -3907,13 +4339,13 @@ int main(int argc, char **argv)
 		m.set_scenery_culling(m.side_columns() ? 2 : 0);
 		if (!skip_boot()) m.restore_warning();   // (the match's shortened WARNING: whole again for a boot that's seen)
 		apply_play_style();
-		menu.set_title("PAUSED");
+		menu.set_title(tr::TITLE_PAUSED);
 		reset_game();
 		// back on the Online page: what ended the match, and the same again a press away
 		if (reopen && menu.ready()) {
 			if (menu.is_open()) menu.close();
 			menu.open(main_page());
-			menu.select_row(5);   // (Online)
+			menu.select_row(online_row());
 			menu.push(online_page());
 		}
 		sync_menu_sound();
@@ -3944,40 +4376,48 @@ int main(int argc, char **argv)
 	};
 	auto online_pass = [&] {
 		online.poll(double(SDL_GetTicksNS()) / 1e6);
+		msound.held = online.watch_hushed();
 		Online::Notice n;
 		while (online.next_notice(n)) {
-			if (n.kind == Online::Notice::joined) {
-				if (cfg.online.chime) chime::play(chime_stream, win, audio && !hidden ? float(cfg.volume) / 100.0f : 0.0f);
+			if (n.kind == Online::Notice::joined || n.kind == Online::Notice::watching) {
+				const bool watching = n.kind == Online::Notice::watching;
+				if (cfg.online.chime && !watching) chime::play(chime_stream, win, audio && !hidden ? float(cfg.volume) / 100.0f : 0.0f, coin.get(), coin_sound::RATE);
 				match_on = true;
-				match_sound_start();
-				{   // the players' names under the energy bars (the name the other side was sent; theirs as the HUD can show it)
-					std::string names[2];
-					names[online.local_player()] = online.identity.name;
-					names[online.local_player() ^ 1] = online.opponent();
-					hud_country[online.local_player()] = online.my_country();
-					hud_country[online.local_player() ^ 1] = online.peer_country();
-					hud_player[0] = names[0];
-					hud_player[1] = names[1];
-					hud_in_shown = -1;   // (set on the HUD below, for the players in the game)
+				if (!watching || !watch_sound_started) match_sound_start();   // (a watcher's going since its first frame)
+				watch_sound_started = false;
+				// the players' names under the energy bars (the names the two sides were sent; a watched match's, as its
+				// host sent them)
+				for (int p = 0; p < 2; p++) {
+					hud_player[p] = online.player_name(p);
+					hud_country[p] = online.player_country(p);
 				}
+				hud_in_shown = -1;   // (set on the HUD below, for the players in the game)
 				game_frame = vf2net::BOOT_FRAMES;
 				assign_before.reset();   // (the board's arcade settings are the host's now: no restart for them)
 				if (menu.is_open()) { menu.close(); menu_closed_elsewhere = true; }
 				restart_clock();
 				sync_menu_sound();
 				// who's playing who, over the title screen for a moment (the host is player 1)
-				const std::string host = online.is_hosting() ? online.identity.name : online.opponent(), guest = online.is_hosting() ? online.opponent() : online.identity.name;
+				const std::string host = online.player_name(0), guest = online.player_name(1);
 				const int ms = online.ping();
 				// (with each one's fighter under the name: Random, a seed's, Cheats' random fighters)
-				const std::string me_ft = vf2net::fighter_words(online.identity.extra, m), them_ft = vf2net::fighter_words(online.opponent_extra(), m);
-				menu.show_versus({ "PLAYER 1 \xC2\xB7 HOST", host, "PLAYER 2", guest,
-				                   std::string(online.via_relay() ? "Connected through the relay" : "Connected directly") + (ms > 0 ? " \xC2\xB7 " + std::to_string(ms) + " ms" : ""),
-				                   online.slow_local() ? "Through the relay: this Mac blocks your network. Turn on Local Network (System Settings) for a faster match"
-				                                       : "Both press Start", online.via_relay(),
-				                   online.is_hosting() ? online.my_country() : online.peer_country(), online.is_hosting() ? online.peer_country() : online.my_country(),
-				                   online.is_hosting() ? me_ft : them_ft, online.is_hosting() ? them_ft : me_ft });
+				// (RANDOM and a seed's number in the language on; a seed's own name as it is)
+				auto fighter_said = [&](int pl) -> std::string {
+					const std::string x = online.player_extra(pl), w = vf2net::fighter_words(x, m);
+					if (x == "R") return tr::VS_FIGHTER_RANDOM;
+					if (w.rfind("SEED ", 0) == 0) return tr::fill(tr::VS_FIGHTER_SEED, { { "n", w.substr(5) } });
+					return w;
+				};
+				const std::string ft[2] = { fighter_said(0), fighter_said(1) };
+				if (watching)
+					menu.show_versus({ tr::VS_PLAYER_1, host, tr::VS_PLAYER_2, guest, tr::WATCHING_BEHIND, tr::WATCHING_HOW_TO_STOP, false, online.player_country(0), online.player_country(1), ft[0], ft[1] });
+				else
+					menu.show_versus({ tr::VS_PLAYER_1_HOST, host, tr::VS_PLAYER_2, guest,
+					                   ms > 0 ? tr::fill(online.via_relay() ? tr::VS_RELAY_MS : tr::VS_DIRECT_MS, { { "ms", std::to_string(ms) } }) : std::string(online.via_relay() ? tr::VS_RELAY : tr::VS_DIRECT),
+					                   online.slow_local() ? tr::VS_MAC_LOCAL : tr::VS_BOTH_PRESS_START, online.via_relay(),
+					                   online.player_country(0), online.player_country(1), ft[0], ft[1] });
 			}
-			fprintf(stderr, "online: %s\n", Online::log_masked(n.text).c_str());
+			fprintf(stderr, "online: %s\n", Online::log_masked(n.text.en()).c_str());
 		}
 		if (match_on) {   // (each player's name and flag on the HUD only while they're in the game: a side the CPU has, the game's own)
 			const int in = online.players_in_game();
@@ -4012,34 +4452,38 @@ int main(int argc, char **argv)
 		}
 		said_wait = wait;
 		const bool press = wait == 1 || wait == 3;
-		menu.set_banner(press ? "PRESS" : wait ? "WAITING FOR " + online.opponent() : "",
-		                wait == 2 ? "to press Start" : wait == 3 ? "for a rematch" : wait == 4 ? "to press Start for a rematch" : "", press ? start_button() : "");
+		// (a room's host, someone in its line: the guest about to make way for them, said for the moment before)
+		if (online.making_way()) menu.set_banner(tr::BANNER_NEXT_IN_LINE, tr::fill(tr::BANNER_MAKES_WAY, { { "name", online.opponent() } }));
+		else menu.set_banner(press ? std::string(tr::BANNER_PRESS) : wait ? tr::fill(tr::BANNER_WAITING_FOR, { { "name", online.opponent() } }) : "",
+		                     wait == 2 ? std::string(tr::BANNER_TO_PRESS_START) : wait == 3 ? std::string(tr::BANNER_FOR_REMATCH) : wait == 4 ? std::string(tr::BANNER_TO_PRESS_REMATCH) : "", press ? start_button() : "");
 		if (interrupted)
-			menu.set_notice("WAITING FOR " + online.opponent(), "The connection dropped. Holding the match for " + std::to_string(online.hold_left()) + " s...",
-			                "It carries on from right here if it comes back");
-		else if (online.starting()) menu.set_notice("STARTING THE MATCH", online.status());
+			menu.set_notice(tr::fill(tr::BANNER_WAITING_FOR, { { "name", online.opponent() } }), tr::fill(tr::NOTICE_DROPPED, { { "n", std::to_string(online.hold_left()) } }),
+			                tr::NOTICE_CARRIES_ON);
+		else if (online.starting()) menu.set_notice(tr::NOTICE_STARTING, online.status());
+		else if (online.watch_between()) menu.set_notice(tr::MATCH_OVER, online.watch_status());   // (a watched match over: not its last picture, still)
+		else if (online.watch_between()) menu.set_notice(tr::MATCH_OVER, online.watch_status());   // (a watched match over: not its last picture, still)
 		else menu.set_notice("");
 		std::string line;
 		if (cfg.online.show_connection && online.waiting() && !online.starting())   // (playing alone meanwhile: still waiting, and where)
 			line = online.phase() == Online::Phase::hosting && online.by_code() && !online.is_random()
-				? "Hosting   " + (online.room_code().empty() ? std::string("a room") : "room " + online.room_code()) + "   " + online.status()
+				? (online.room_code().empty() ? std::string(tr::LINE_HOSTING_A_ROOM) : tr::fill(tr::LINE_HOSTING_ROOM, { { "code", online.room_code() } })) + "   " + online.status()
 				: online.phase() == Online::Phase::hosting && !online.by_code()
-				? "Hosting   " + (online.local_address().empty() ? std::string("no network") : online.local_address()) + "   " + online.status()
+				? tr::fill(tr::LINE_HOSTING_AT, { { "address", online.local_address().empty() ? std::string(tr::LINE_NO_NETWORK) : online.local_address() } }) + "   " + online.status()
 				: online.status();
 		static game_menu::net_cells cells;
 		static uint64_t cells_at = 0;
 		static bool had_cells = false;
-		if (!online.playing() || !cfg.online.show_connection || menu.versus_showing()) {
+		if (!online.playing() || (!cfg.online.show_connection && !online.watching()) || menu.versus_showing()) {
 			had_cells = false;
 			menu.set_net(menu.versus_showing() ? std::string() : line, 0);
 		} else if (!had_cells || SDL_GetTicks() - cells_at >= 250 || online.interrupted() != cells.interrupted) {
-			had_cells = online.connection(cells, cfg.online.show_connection == 2);
+			had_cells = online.connection(cells, cfg.online.show_connection == 2 && !online.watching());
 			cells_at = SDL_GetTicks();
 			if (had_cells) menu.set_net(cells);
 			else menu.set_net(std::string(), 0);
 		}
 		// the Online page as things change: its rows made again with the phase, its status lines a few times a second
-		if (menu.is_open() && (online.phase() != online_was || online.room_code() != online_code_was) && menu.top_name() == "Online" && !menu.capturing())
+		if (menu.is_open() && (online.phase() != online_was || online.room_code() != online_code_was) && menu.top_name() == tr::P_ONLINE.c_str() && !menu.capturing())
 			menu.replace(online_page(), -1);
 		else if (menu.is_open() && online.phase() != online_was && !menu.capturing())
 			menu.refresh();
@@ -4052,10 +4496,10 @@ int main(int argc, char **argv)
 			static std::string said;
 			if (const std::string now = online.status(); now != said) { said = now; menu.refresh(); }
 		}
-		else if (menu.is_open() && online.phase() == Online::Phase::off && menu.top_name() == "Online" && !menu.capturing()) {
-			static int said = -2;   // (the Online screen: how many play at random, as the lobby says)
-			if (const int nn = online.players_online(cfg.online); nn != said) { said = nn; menu.refresh(); }
-		}
+		else if (menu.is_open() && online.phase() == Online::Phase::off && menu.top_name() == tr::P_ONLINE.c_str() && !menu.capturing())
+			// (the Online screen, the room browser: the rooms asked for every 15 s and the page made again as they change,
+			// the room selected kept; how many play at random, as the lobby says. Not a match's end, nor a try that failed)
+			online_menu::keep_up(online, cfg.online, menu, online_page);
 		online_was = online.phase();
 		if (!menu.capturing()) online_code_was = online.room_code();
 	};
@@ -4215,7 +4659,7 @@ int main(int argc, char **argv)
 		if (k.scancode == SDL_SCANCODE_RETURN && (k.mod & SDL_KMOD_ALT)) return true;
 		if (k.scancode != SDL_SCANCODE_F || (k.mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI))) return false;
 		for (const auto &c : cfg.ctl)
-			for (SDL_Scancode s : c.key) if (s == SDL_SCANCODE_F) return false;
+			for (int a = 0; a < C_COUNT; a++) if (c.key[a] == SDL_SCANCODE_F || c.key2[a] == SDL_SCANCODE_F) return false;   // (first or second)
 		return true;
 	};
 	while (running) {
@@ -4229,23 +4673,47 @@ int main(int argc, char **argv)
 			if (os.name.empty()) os.name = "PLAYER";   // (no name asked for: the command line's)
 			if (arg_port) os.port = arg_port;
 			if (!arg_join.empty()) os.address = cfg.online.address = online_menu::clean_address(arg_join);   // (the Online screen says where)
-			std::string err;
-			if (!(arg_host ? online.host(os, err) : online.join(os, err))) fprintf(stderr, "online: %s: %s\n", arg_host ? "--host" : "--join", err.c_str());
+			tr::line err;
+			if (!(arg_host ? online.host(os, err) : online.join(os, err))) fprintf(stderr, "online: %s: %s\n", arg_host ? "--host" : "--join", err.en().c_str());
 			else fprintf(stderr, "online: %s from the command line\n", arg_host ? "hosting by address" : ("joining " + os.address).c_str());
 			if (menu.ready()) {
 				if (menu.is_open()) menu.close();
 				menu.open(main_page());
-				menu.select_row(5);   // (Online)
+				menu.select_row(online_row());
 				menu.push(online_page());
 			}
 		}
 		static const char *test_host_room = getenv("VF2_HOST_ROOM"), *test_join_code = getenv("VF2_JOIN_CODE"), *test_random = getenv("VF2_RANDOM");
-		if ((test_host_room || test_join_code || test_random) && pass == 60) {
+		// a link (the command line, a Mac's open-URL event, or handed over by another copy): once the game's up, into
+		// the room or the match, as Online > Enter code (only the link's own form: links::parse)
+		if (pass % 60 == 0) { std::string handed; if (links::take(data, handed)) arg_link = handed; }
+		if (!arg_link.empty() && pass >= 60 && menu.ready()) {
+			links::Link l;
+			const std::string url = arg_link;
+			arg_link.clear();
+			if (!links::parse(url, l)) fprintf(stderr, "links: not a link this game takes: %s\n", Online::log_masked(url.substr(0, 40)).c_str());
+			else if (const tr::line no = online_menu::link_refused(online); !no.empty()) { menu.toast(no.str()); fprintf(stderr, "links: %s %s: not now (%s)\n", l.action.c_str(), l.code.c_str(), no.en().c_str()); }
+			else {
+				online_page();   // (the identity, as opening the Online page sets it)
+				tr::line err;
+				const bool ok = online_menu::follow_link(online, cfg.online, menu, [&] { cfg_dirty = true; }, l.action, l.code, [&] {
+					if (menu.is_open()) menu.close();
+					menu.open(main_page());
+					menu.select_row(online_row());
+					menu.push(online_page());
+				}, err);
+				fprintf(stderr, "links: %s %s%s%s\n", l.action.c_str(), l.code.c_str(), ok ? "" : (": " + err.en()).c_str(), ok && cfg.online.name.empty() && l.action != "watch" ? " (a name asked for first)" : "");
+				SDL_RaiseWindow(win);
+			}
+		}
+		static const char *test_watch = getenv("VF2_WATCH_CODE");
+		if ((test_host_room || test_join_code || test_random || test_watch) && pass == 60) {
 			online_page();   // (the identity, as opening the Online page sets it)
-			std::string err;
-			if (!(test_random ? online.find_random(cfg.online, err)
+			tr::line err;
+			if (getenv("VF2_HOST_PUBLIC")) cfg.online.room_who = 2;
+			if (!(test_watch ? online.watch(cfg.online, test_watch, err) : test_random ? online.find_random(cfg.online, err)
 			      : test_join_code ? online.join_room(cfg.online, test_join_code, err) : online.host_room(cfg.online, err)))
-				fprintf(stderr, "online: (test) %s\n", err.c_str());
+				fprintf(stderr, "online: (test) %s\n", err.en().c_str());
 		}
 		online_pass();
 		const pace_window pace0 = pace;
@@ -4293,10 +4761,52 @@ int main(int argc, char **argv)
 		}
 		for (int64_t at : resets_at)
 			if (at == pass) { SDL_Event r{}; r.type = SDL_EVENT_RENDER_DEVICE_RESET; SDL_PushEvent(&r); }
+		if (static const char *rs = getenv("VF2_TEST_RESIZE"); rs) {   // (tests: the window resized as by hand, "WxH@pass", "WxH+X+Y@pass")
+			int rw = 0, rh = 0, rx = 0, ry = 0;
+			long long at = 0;
+			if (sscanf(rs, "%dx%d+%d+%d@%lld", &rw, &rh, &rx, &ry, &at) == 5 && pass == at) { SDL_SetWindowSize(win, rw, rh); SDL_SetWindowPosition(win, rx, ry); SDL_SyncWindow(win); }
+			else if (sscanf(rs, "%dx%d@%lld", &rw, &rh, &at) == 3 && pass == at) { SDL_SetWindowSize(win, rw, rh); SDL_SyncWindow(win); }
+		}
+		if (getenv("VF2_TEST_WINDOW_LOG") && pass % 20 == 0) {   // (tests: the window's pixels and Window size)
+			int pw = 0, ph = 0, x = 0, y = 0, lw = 0, lh = 0;
+			SDL_RendererLogicalPresentation mode;
+			SDL_GetWindowSizeInPixels(win, &pw, &ph);
+			SDL_GetWindowPosition(win, &x, &y);
+			SDL_GetRenderLogicalPresentation(ren, &lw, &lh, &mode);
+			fprintf(stderr, "test: pass %lld: the window %d x %d pixels at %d, %d, window_scale %d, the picture %d x %d\n",
+			        (long long)pass, pw, ph, x, y, cfg.window_scale, lw, lh);
+		}
+		if (window_rescale) { window_rescale = false; apply_window_scale(); menu.refresh(); }   // (the last pass's events asked)
+		if (window_moved) { window_moved = false; remember_window(); }
 		SDL_Event e;
 		const bool menu_was_open = menu.is_open();
 		while (SDL_PollEvent(&e)) {
+			// (a Mac's open-URL event, as SDL gives it: a link from the web, the game running or just started by it)
+			if (e.type == SDL_EVENT_DROP_FILE && e.drop.data && links::is_link(e.drop.data)) arg_link = std::string(e.drop.data).substr(0, 64);
 			if (e.type == SDL_EVENT_JOYSTICK_ADDED) give_unknown_sticks();   // (a gamepad's added event follows for one given a layout)
+			if (e.type == SDL_EVENT_WINDOW_MOVED || e.type == SDL_EVENT_WINDOW_RESIZED || e.type == SDL_EVENT_WINDOW_MAXIMIZED ||
+				e.type == SDL_EVENT_WINDOW_RESTORED)
+				window_moved = true;
+			// (fullscreen by the system's own way, a Mac's green button: remembered as the menu's is)
+			if ((e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN || e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) && !fs_win_on &&
+				cfg.fullscreen != (e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN)) {
+				cfg.fullscreen = e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN;
+				cfg_dirty = true;
+			}
+			if (e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN && cfg.window_scale > 0) window_rescale = true;
+			// Window size: the window resized by hand (a corner dragged, maximised): Free again
+			if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED && cfg.window_scale > 0 && !window_rescale && !is_fullscreen() &&
+				(e.window.data1 != win_expect_w || e.window.data2 != win_expect_h)) {
+				int pw = 0, ph = 0;
+				SDL_GetWindowSize(win, &pw, &ph);
+				if (pw == win_set_w && ph == win_set_h) window_rescale = true;   // (the same points: another density)
+				else {
+					fprintf(stderr, "window size: resized to %d x %d pixels: Free\n", e.window.data1, e.window.data2);
+					cfg.window_scale = 0;
+					cfg_dirty = true;
+					menu.refresh();
+				}
+			}
 			if (e.type == SDL_EVENT_QUIT) running = false;
 			else if (e.type == SDL_EVENT_WILL_ENTER_BACKGROUND) {   // (Android: nothing runs in the background)
 				suspended = true;
@@ -4318,7 +4828,7 @@ int main(int argc, char **argv)
 			// (F11 and Alt+Enter with the menu open too, unless it's waiting for a key: Alt+Enter was its Enter)
 			else if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && menu.is_open() && !menu.capturing()
 					 && (e.key.scancode == SDL_SCANCODE_F11 || (e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))))
-				set_fullscreen(!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
+				set_fullscreen(!is_fullscreen());
 			else if (menu.handle_event(e)) continue;
 			else if (e.type == SDL_EVENT_FINGER_DOWN || e.type == SDL_EVENT_FINGER_MOTION ||
 					 e.type == SDL_EVENT_FINGER_UP || e.type == SDL_EVENT_FINGER_CANCELED) {
@@ -4346,7 +4856,7 @@ int main(int argc, char **argv)
 				else if (e.key.scancode == SDL_SCANCODE_F3) reset_game();
 				else if (e.key.scancode == SDL_SCANCODE_F5) set_scale(scale_wanted % MAX_SCALE + 1);
 				else if (e.key.scancode == SDL_SCANCODE_F6) set_shape((aspect_i + 1) % N_ASPECTS);
-				else if (e.key.scancode == SDL_SCANCODE_F11 || fullscreen_key(e.key)) set_fullscreen(!(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
+				else if (e.key.scancode == SDL_SCANCODE_F11 || fullscreen_key(e.key)) set_fullscreen(!is_fullscreen());
 				else if (e.key.scancode == SDL_SCANCODE_F12) {
 					// F12: the picture as drawn, into Screenshots in the NVRAM folder (numbered, never overwritten)
 					const std::string shots = data + "/Screenshots";
@@ -4374,8 +4884,10 @@ int main(int argc, char **argv)
 			}
 			// the arcade settings are read as the game starts: restart it if one is different
 			if (assign_before) {
-				const bool changed = *assign_before != assignments_now();
+				const auto now = assignments_now();
+				const bool changed = *assign_before != now, cold = (*assign_before)[N_ASSIGN + 4] != now[N_ASSIGN + 4];
 				assign_before.reset();
+				if (cold) cold_start();   // (Debug mode: a start's game, exactly)
 				if (changed) reset_game();
 			}
 			pstate[0] = pstate[1] = pad_state{};   // the button that closed it isn't a move
@@ -4443,6 +4955,7 @@ int main(int argc, char **argv)
 			m.set_draw_3d(last || sync.enabled);
 			if (test_stage >= 0 && (m.game_mode() == 7 || m.game_mode() == 8))   // VF2_STAGE (tests: the fight's stage)
 				const_cast<std::vector<u8> &>(m.workram())[0x64] = u8(test_stage);
+			if (!g_match_board) stage_select(m, cfg.stage);   // Arcade settings > Stage select (offline only)
 			m.run_frame();
 			sysinfo::note_frame();   // (on the thread that ran it)
 			m.set_draw_3d(true);
@@ -4493,6 +5006,12 @@ int main(int argc, char **argv)
 			}
 			m.m_audio_out.clear();
 			game_frame++;
+			// (tests: the game's work RAM hashed every 30 frames, VF2_TEST_RAM_LOG=file: the game the same whatever the
+			// display's settings, Display > HUD's, V-Sync's, the frame limit's)
+			if (static FILE *rl = getenv("VF2_TEST_RAM_LOG") ? fopen(getenv("VF2_TEST_RAM_LOG"), "w") : nullptr; rl && game_frame % 30 == 0) {
+				fprintf(rl, "%llu %016llx\n", (unsigned long long)game_frame, (unsigned long long)fnv(m.workram().data(), m.workram().size()));
+				fflush(rl);
+			}
 			if (pace_log && game_frame % 60 == 0)
 				fprintf(stderr, "frame %llu at %.3f s, queued %d bytes, made %zu\n", (unsigned long long)game_frame, double(SDL_GetTicksNS() - start_ns) / 1e9, audio ? SDL_GetAudioStreamQueued(audio) : -1, m.m_audio_out.size());
 			if (quit_after >= 0 && int64_t(game_frame) >= quit_after) running = false;
@@ -4511,6 +5030,7 @@ int main(int argc, char **argv)
 			if (menu.is_open()) { into = show; held_now = !show; return false; }   // (this frame is the one on show)
 			return true;
 		};
+		m.set_debug_mode(cfg.debug_mode && !online.playing() && !g_match_board);   // (Arcade settings > Debug mode: offline only)
 		if (online.playing()) {
 			// A match: each frame through the session, with this player's input (either player's controls play this
 			// player's fighter; nothing while the menu's open); a frame that can't run yet (the other side behind, or
@@ -4543,6 +5063,18 @@ int main(int argc, char **argv)
 			}
 			due = 0;
 		}
+		// Display > Frame limit: the pictures a second at most. With vsync, one at or over the screen's rate is a picture
+		// each refresh (the budget a little over the screen's: by the budget alone a refresh a hair early found it a hair
+		// short, and that refresh's picture was lost); the governor's 60 for now. Only the pictures: the frames go by
+		// the clock (and online, the session's) whatever it is. Under the game's own 57.5 (30), a frame's picture
+		// waits for the budget too (the frame run, its 3D drawn with the next shown, as when the machine's behind)
+		const double screen_rate = screen_hz_now > 0 ? double(screen_hz_now) : 60.0;
+		double picture_cap = cfg.frame_limit == 0 ? 1e6 : cfg.frame_limit < 0 ? screen_rate : double(cfg.frame_limit);
+		if (vsync_now != 0 && picture_cap >= screen_rate * 0.95) picture_cap = std::max(picture_cap, screen_rate + 1.0);
+		if (smooth_limit) picture_cap = std::min(picture_cap, 60.0);
+		const bool capped_low = picture_cap < FRAME_HZ * 0.95;
+		const bool frame_picture = !capped_low || smooth_budget >= 1 || stopped;
+		if (online.playing() && !frame_picture) draw_into_texture = false;   // (a match's frames too, by the budget: as VF3's)
 		// the frame run during the last present: its picture drawn now, as if it had run here
 		const bool took_ahead = ahead.carried;   // (counted as a frame run in this pass, below)
 		if (took_ahead) { draw_into_texture = ahead.into; held = ahead.held; ahead.carried = false; }
@@ -4550,7 +5082,7 @@ int main(int argc, char **argv)
 			// Behind (several frames to run at once), only the last is drawn: the others wouldn't be
 			// seen. (The 3D of a frame not drawn is drawn with the next, as MAME draws it; with scene
 			// sync every frame's 3D is set up, as it may be shown two frames on, and drawn if it is.)
-			const bool last = i == due - 1 || script.shots.count(game_frame) ||
+			const bool last = (i == due - 1 && frame_picture) || script.shots.count(game_frame) ||
 				(quit_after >= 0 && int64_t(game_frame) + 1 >= quit_after);
 			if (audio && !ff && SDL_GetAudioStreamQueued(audio) == 0 && shown) load.starved++, pass_starved++;
 			const uint64_t te = SDL_GetTicksNS(), waited = m.render_waited_ns();
@@ -4614,11 +5146,10 @@ int main(int argc, char **argv)
 		float alpha = 1;
 		{
 			const uint64_t bt = SDL_GetTicksNS();
-			// (a picture each refresh: the screen's rate when it's faster than 120, as VF1's; only while vsync
-			// is on: off, forced so in a driver's settings, nothing paces the passes to the screen, 120 a
-			// second then, as VF1's and VF3's)
-			const double smooth_rate = smooth_limit ? 60.0 : vsync_now != 0 ? std::max(120.0, double(screen_hz_now) + 1.0) : 120.0;
-			smooth_budget = std::min(2.0, smooth_budget + double(bt - smooth_budget_t) * smooth_rate / 1e9);
+			// (the frame limit's budget, picture_cap above: with vsync and the screen's rate a picture each refresh,
+			// as before at any rate; with vsync off, forced so in a driver's settings, nothing paces the passes to
+			// the screen: the limit's number then)
+			smooth_budget = std::min(2.0, smooth_budget + double(bt - smooth_budget_t) * picture_cap / 1e9);
 			smooth_budget_t = bt;
 			const bool unseen = !hidden && (SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED));
 			if (smooth_on() && !stopped && !ff && last_shown && !held && !unseen && (draw_into_texture || (due == 0 && !took_ahead && smooth_budget >= 1))) {
@@ -4626,7 +5157,7 @@ int main(int argc, char **argv)
 				smooth_budget = std::max(0.0, smooth_budget - 1);
 				alpha = float(std::clamp(frame_clock - double(frames_run), 0.0, 1.0));
 				draw_into_texture = true;
-			}
+			} else if (draw_into_texture && capped_low) smooth_budget = std::max(0.0, smooth_budget - 1);   // (a frame's own picture, within the limit)
 		}
 		// the 3D on the GPU (see gpu3d_state), the 2D's parts put together around it (gpu_picture)
 		if (draw_into_texture && g3.on && !g3.failed && g3_targets(m.width() * scale, model2a::HEIGHT * scale) && gpu_pic.ready(m.width(), scale)) {
@@ -4819,14 +5350,14 @@ int main(int argc, char **argv)
 				aa = 1;
 				set_scale(1, false);
 				fprintf(stderr, "the 3D on the CPU: drawn at 1x without antialiasing for this run (the settings kept)\n");
-				if (cpu_why_new) cpu_why += " Drawn at 1x without antialiasing for this run, as the CPU can keep up (Display's settings are kept).";
+				if (cpu_why_new) cpu_why_cut = true;   // (said with the notice)
 			}
 		}
 		if (online.phase() != Online::Phase::off && !cpu_why.empty() && menu.toast_showing()) { menu.toast(""); cpu_why_new = true; }
 		if (cpu_why_new && online.phase() == Online::Phase::off) {
 			cpu_why_new = false;
-			menu.toast("The 3D is on the CPU: " + cpu_why, 12);
-			fprintf(stderr, "the notice: The 3D is on the CPU: %s\n", cpu_why.c_str());   // (in the log too: what the player was told)
+			menu.toast(cpu_notice().str(), 12);
+			fprintf(stderr, "the notice: %s\n", cpu_notice().en().c_str());   // (in the log too: what the player was told)
 		}
 		if (const uint64_t now = SDL_GetTicksNS(); now - fps_since >= 500000000) {
 			menu.set_fps(cfg.show_fps ? std::to_string(int(std::lround(fps_shown * 1e9 / double(now - fps_since)))) + " FPS" : "");
@@ -4916,7 +5447,7 @@ int main(int argc, char **argv)
 		// present waits (see emu_job): not for a frame whose picture the test run writes, nor its last
 		bool ran_ahead = false;
 		uint64_t ahead_ns = 0, ahead_waited = 0;
-		if (emu_threaded && running && shown && smooth_on() && !paused && !menu.is_open() && !ff && !sound_full && !online.playing() &&
+		if (emu_threaded && running && shown && smooth_on() && !paused && !menu.is_open() && !ff && !sound_full && !online.playing() && !capped_low &&
 			!script.shots.count(game_frame) && !(quit_after >= 0 && int64_t(game_frame) + 1 >= quit_after) &&
 			frame_clock + FRAME_HZ / (hidden || screen_hz_now <= 0 ? 120.0 : double(screen_hz_now)) >= double(frames_run + 1)) {
 			if (audio && SDL_GetAudioStreamQueued(audio) == 0) load.starved++, pass_starved++;
@@ -5051,10 +5582,11 @@ int main(int argc, char **argv)
 			{   // (the log says when it's on or off)
 				int vs = 0;
 				const int on = SDL_GetRenderVSync(ren, &vs) && vs != 0;
-				if (on != vsync_now) fprintf(stderr, "vsync: %s\n", on ? "on" : "off (smooth pictures 120 a second, not one each refresh)");
+				if (on != vsync_now) fprintf(stderr, "vsync: %s\n", on ? "on" : "off (pictures by Display > Frame limit, not one each refresh)");
 				vsync_now = on;
 			}
 			if (smooth_on()) enough = std::max(55.0, std::min<double>(screen_hz, smooth_limit ? 60 : 120) * 0.9);
+			enough = std::min(enough, picture_cap * 0.9);   // (Display > Frame limit: no more asked for than it lets through)
 			// Judged on the window's ordinary passes only (gov), and only when they're most of it: a
 			// window taken up by scene changes says nothing either way (its streaks stay as they were)
 			const double gsecs = double(gov.time) / 1e9;
@@ -5198,6 +5730,7 @@ int main(int argc, char **argv)
 	msound.stop();
 	online.stop();   // (closed in a match: the other side is told at once, not after a silence)
 	Online::flush(1500);   // (and the lobby told: a room closed, a search left)
+	links::stopped(data);
 	if (g_match_board) {   // (this player's own NVRAM, not the host's, saved)
 		memcpy(m.backup_ram().data(), own_backup.data(), std::min(own_backup.size(), m.backup_ram().size()));
 		memcpy(m.eeprom_cells(), own_eeprom, sizeof own_eeprom);
@@ -5205,6 +5738,7 @@ int main(int argc, char **argv)
 	}
 	saver.finish();   // (an autosave still being written, done before the last save: the same files)
 	save_nvram(true);
+	remember_window();
 	if (cfg_dirty && (quit_after < 0 || test_saves)) save_settings();
 	for (auto &[id, j] : vpads) { if (j) SDL_CloseJoystick(j); SDL_DetachVirtualJoystick(id); }
 	if (chime_stream) SDL_DestroyAudioStream(chime_stream);
