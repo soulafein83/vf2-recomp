@@ -65,9 +65,9 @@
 // with it, each pixel a square block: as sharp as the arcade's (Display > Background filter:
 // Smooth softens and smoothly enlarges a fight's stage backdrop instead). Until one is chosen,
 // the scale fits the window as it first opens (the scale whose picture is at least as tall as
-// the window's, 4 at most); F5 steps through 1 to 6. If the computer can't keep up (the work
-// leaves no time to spare, or the sound runs dry), antialiasing goes off, then the scale is
-// lowered a step at a time, down to 1 (for this run: the player's own choice is what's saved).
+// the window's, 4 at most); F5 steps through 1 to 6. The player's scale and antialiasing stay as
+// set (the governor lowers them only in tests, VF2_GOVERN_CUTS; a 3D left to the CPU with the
+// setting not CPU is drawn at 1x for the run, and says so).
 //
 // --aspect sets the picture's shape; F6 steps through them. The default, fit, follows the window's
 // shape (between 4:3 and 80:9: five 16:9 screens side by side); the others keep theirs, with black bars. 4:3 is the arcade's
@@ -87,7 +87,7 @@
 //
 // Keys:  player 1: arrows, Z guard, X punch, C kick, 1 start
 //        player 2: I J K L, B guard, N punch, M kick, 2 start (both remapped in Controls)
-//        5 / 6 coins, F2 test, 9 service, Esc the menu, P pause, F3 reset, F5 render scale,
+//        5 / 6 coins, F2 test, 9 service, Esc the menu, P pause, F3 reset, F4 free camera, F5 render scale,
 //        F6 picture shape, F9 frame timings, F11 (or F, Alt+Enter) fullscreen, F12 a screenshot (Screenshots in
 //        the NVRAM folder), Tab held: as fast as it goes
 // Pads:  d-pad or left stick, X guard, A punch, B kick, Y guard+punch, RB punch+kick,
@@ -95,8 +95,16 @@
 //        cabinet's start button); Menu (View tapped by default), L3 + R3 or the touchpad click: the
 //        menu (View held + Start too); a Coin key or button for each player (none by default; View
 //        tapped is a coin only when it's set as Coin); View + LB: render scale;
-//        View + RB: picture shape. Pads come and go as they're plugged in; each player's pad and
+//        View + RB: picture shape; View + R3: free camera. Pads come and go as they're plugged in; each player's pad and
 //        buttons are chosen in Controls.
+// Free camera (F4, View + R3, or Display > Free camera; never saved): the picture seen from a camera flown around the
+//        fight, the game going on beneath it (P pauses it, the camera still flying), the players' own inputs kept
+//        from the game meanwhile; the picture only (model2_video's freecam_*: never what the game reads). WASD and
+//        the mouse (captured), E or Space up, Q or Ctrl down, Shift x4, Alt x0.25, the wheel the speed, the arrows
+//        look too, R back to the game's camera; on a pad the left stick moves, the right looks, LT and RT down and
+//        up, L3 held x4, LB and RB the speed, Y back to the game's camera. Offline and while watching a match, not
+//        while playing one (it goes off as one starts). VF2 has no camera of its own to read: the game's camera's
+//        move is worked out from the stage's pieces that sat still, and the free camera stays put in the world.
 // Sticks: a joystick SDL doesn't know as a pad (a DirectInput arcade stick) is given a fighting stick's layout
 //        (give_stick_layout); Controls > Player > Set up buttons makes one from its own presses (settings.ini's
 //        pad_mapping); a gamecontrollerdb.txt in the data folder or beside the program is read too.
@@ -138,6 +146,24 @@
 //   VF2_JOIN_CODE=XXXXXX joins that room at pass 60 (VF_LOBBY: another lobby); VF2_RANDOM=1 Quick match
 //   VF2_WATCH_CODE=XXXXXX watches that match at pass 60, as Online > a room > Watch
 //   VF2_HOST_PUBLIC=1    VF2_HOST_ROOM's room listed in Rooms (its matches may be watched by its code either way)
+//   VF2_TEST_FREECAM=... the free camera at game frames, e.g. on@600,yaw@620=180,pitch@640=-30,move@660=0,2,-5,
+//                        pause@700,yaw@720=90,shot@730=name,off@800: on, off, reset; a turn (degrees: yaw to the right,
+//                        pitch up) or a move (forward, right, up; in rings' widths) at once; pause, resume (P);
+//                        shot: the picture on show then to build/host_fc_<name>.png. The steps' clock is the game's
+//                        frames, and a pass of the loop for each pass while the game's stopped (paused)
+//   VF2_TEST_FREECAM_PATH=f the free camera flown along the path in f (free_cam_path.h: keys, orbits round the
+//                        fighters, pause and unpause, on the same clock as VF2_TEST_FREECAM's), for footage with
+//                        VF2_RECORD (a recording goes on through a pause: a picture each pass, the sound silent
+//                        meanwhile). VF2_TEST_FREECAM_PATH_LOG=1: every 30 ticks where the game's camera is round the
+//                        fighters, as a path's "rel" key has it (for writing one)
+//   VF2_RECORD=dir       a recording (a trailer's footage): from game frame VF2_RECORD_FROM (default 0; before it as
+//                        fast as it goes, its pictures not drawn) to VF2_RECORD_TO, 60 pictures a second by the
+//                        game's clock, not the real one (smooth motion's in-betweens), the window's whole picture to
+//                        dir/video.mp4 (by ffmpeg) and the sound to dir/sound.wav, in step (through a pause too: a
+//                        picture each pass, silence for its time). Use with VF2_HIDDEN and VF2_WINDOW; the game's
+//                        thread is off meanwhile. VF2_RECORD_HZ=n: n pictures a second instead
+//   VF2_FREECAM_LOG=1    the free camera's working out: the world's up as it comes on, each frame's camera move (the
+//                        still pieces it's from), its place as it's flown
 //   VF2_SHOT_AT=n,...    the window as drawn at these passes, to build/host_window_at_N.png
 //   VF2_TEST_SAVES=1     a test run (VF2_QUIT_AFTER) saves the NVRAM and settings.ini all the same
 //   VF2_KO=P@a[-b]       knocks player P out in every round from game frame a (to b), as vf2run's
@@ -171,6 +197,7 @@
 #include "romset.h"
 #include "png.h"
 #include "input_script.h"
+#include "free_cam_path.h"
 #include "scene_sync.h"
 #include "backgrounds.h"
 #include "gpu_picture.h"
@@ -593,6 +620,7 @@ hotkey read_inputs(model2a &m, SDL_Gamepad *pads[2], pad_state ps[2], const play
 				if (pstart && !st.start_was) { hk = hotkey::menu; st.back_combo = true; }
 				static bool lb_was[2], rb_was[2];
 				if (lb && !lb_was[p]) { hk = hotkey::scale; st.back_combo = true; }
+				if (btn(SDL_GAMEPAD_BUTTON_RIGHT_STICK)) st.back_combo = true;   // (View + R3: the free camera's, read each pass)
 				if (rb && !rb_was[p]) { hk = hotkey::aspect; st.back_combo = true; }
 				lb_was[p] = lb; rb_was[p] = rb;
 			} else {
@@ -3246,7 +3274,42 @@ int main(int argc, char **argv)
 	// returns, and its picture drawn at the next pass, as if it had run there. Meanwhile nothing
 	// else touches the board: the present only, a picture drawn alongside (pipelined) going on as
 	// it does beside any frame. The same frames, the same pictures. VF2_NO_EMU_THREAD=1: off.
-	const bool emu_threaded = getenv("VF2_NO_EMU_THREAD") == nullptr;
+	const bool emu_threaded = getenv("VF2_NO_EMU_THREAD") == nullptr && getenv("VF2_RECORD") == nullptr;   // (a recording: its frames by its own clock)
+	// VF2_RECORD: the recording (see the top)
+	struct {
+		std::string dir;
+		uint64_t from = 0, to = UINT64_MAX, n = 0, base = 0, stopped_n = 0;   // game frames; n: the pictures recorded (stopped_n of them while the game stood still); base: frames_run then
+		bool on = false;
+		FILE *video = nullptr, *wav = nullptr;
+		uint32_t wav_bytes = 0;
+		uint64_t silent = 0;
+		int w = 0, h = 0, hz = 60;
+	} rec;
+	if (const char *d = getenv("VF2_RECORD")) {
+		rec.dir = d;
+		std::error_code rec_ec;
+		std::filesystem::create_directories(rec.dir, rec_ec);
+		if (const char *f = getenv("VF2_RECORD_FROM")) rec.from = strtoull(f, nullptr, 10);
+		if (const char *f = getenv("VF2_RECORD_TO")) rec.to = strtoull(f, nullptr, 10);
+		if (const char *f = getenv("VF2_RECORD_HZ")) rec.hz = std::clamp(atoi(f), 1, 240);
+	}
+	auto wav_header = [&] {
+		const uint32_t rate = model2a::SOUND_RATE, br = rate * 4, sz = 36 + rec.wav_bytes, sixteen = 16;
+		const uint16_t fmt = 1, ch = 2, align = 4, bits = 16;
+		fseek(rec.wav, 0, SEEK_SET);
+		fwrite("RIFF", 1, 4, rec.wav); fwrite(&sz, 4, 1, rec.wav); fwrite("WAVEfmt ", 1, 8, rec.wav);
+		fwrite(&sixteen, 4, 1, rec.wav); fwrite(&fmt, 2, 1, rec.wav); fwrite(&ch, 2, 1, rec.wav);
+		fwrite(&rate, 4, 1, rec.wav); fwrite(&br, 4, 1, rec.wav); fwrite(&align, 2, 1, rec.wav); fwrite(&bits, 2, 1, rec.wav);
+		fwrite("data", 1, 4, rec.wav); fwrite(&rec.wav_bytes, 4, 1, rec.wav);
+		fseek(rec.wav, 0, SEEK_END);
+	};
+	auto rec_stop = [&] {
+		if (rec.video) pclose(rec.video);
+		if (rec.wav) { wav_header(); fclose(rec.wav); }
+		if (rec.on) fprintf(stderr, "record: %llu pictures, %.2f s, to %s\n", (unsigned long long)rec.n, rec.n / double(rec.hz), rec.dir.c_str());
+		rec.video = rec.wav = nullptr;
+		rec.on = false;
+	};
 	fprintf(stderr, "the game's thread: %s\n", emu_threaded ? "on (with smooth motion, the next frame run during the present's wait)" : "off (VF2_NO_EMU_THREAD)");
 	background_job emu_job;
 	struct { bool carried = false, into = false, held = false; } ahead;   // (that frame's picture, for the next pass)
@@ -3313,6 +3376,15 @@ int main(int argc, char **argv)
 	auto touch_shown = [&] {
 		return !menu.is_open() && (cfg.on_screen == 2 || (cfg.on_screen == 1 && touch_present && !pads[0]));
 	};
+	// (Display > Picture's row for them: on Android, or with a touch screen here; and while they're On, so they can
+	// always be turned off. A saved Auto without a touch screen shows nothing, as ever)
+	auto on_screen_row = [&] {
+#if defined(__ANDROID__)
+		return true;
+#else
+		return touch_present || cfg.on_screen == 2;
+#endif
+	};
 	auto back_item = [&] { return menu_item{ tr::BACK, tr::BACK_HELP, {}, {}, [&] { menu.pop(); } }; };
 	// Game > Language: the setting, and the menus made again in the language at once (the page it's on kept)
 	std::function<void()> menus_relabelled;   // (set below, with the pages)
@@ -3326,8 +3398,58 @@ int main(int argc, char **argv)
 		if (menus_relabelled) menus_relabelled();
 	};
 	auto x_n = [](int n) { return tr::fill(tr::N_X, { { "n", std::to_string(n) } }); };
-	auto display_page = [&] {
-		menu_page p{ tr::P_DISPLAY, "", {} };
+	// The free camera (see the top): on; the menu's choice (taken as the menu closes); the speed (the wheel's, LB and
+	// RB's); kept off while an online match is being played (fc_blocked: set once online's made, below)
+	bool freecam = false, fc_menu = false;
+	double fc_speed = 1;
+	std::function<bool()> fc_blocked = [] { return false; };
+	std::function<void(bool, bool)> set_freecam = [](bool, bool) {};
+	// Display's rows in three pages of their own, each a row of Display with what it's set to in a few words (a page
+	// is 14 rows at most: menu.rcss): Picture, Quality, Screen filter and colours. Each row as it was.
+	auto picture_page = [&] {
+		menu_page p{ tr::D_PICTURE, "", {} };
+		p.items.push_back({ tr::D_SHAPE, tr::D_SHAPE_HELP,
+			[&] { return std::string(aspect_i ? ASPECT_NAMES[aspect_i] : tr::D_SHAPE_FIT.c_str()); },
+			[&](int d) { set_shape(wrap(aspect_i + d, N_ASPECTS)); } });
+#if !defined(__ANDROID__)
+		p.items.push_back({ tr::D_WINDOW_SIZE, tr::D_WINDOW_SIZE_HELP,
+			[&] {
+				if (cfg.window_scale <= 0) return std::string(tr::D_FREE);
+				int w, h;
+				window_target(cfg.window_scale, w, h);
+				return tr::fill(is_fullscreen() ? tr::D_WINDOW_N_IN_WINDOW : tr::D_WINDOW_N, { { "n", std::to_string(cfg.window_scale) }, { "w", std::to_string(w) }, { "h", std::to_string(h) } });
+			},
+			[&](int d) { set_window_scale(wrap(cfg.window_scale + d, window_scale_most() + 1)); } });
+#endif
+		p.items.push_back({ tr::D_FULLSCREEN, tr::D_FULLSCREEN_HELP,
+			[&] { return on_off(is_fullscreen()); },
+			[&](int) { set_fullscreen(!is_fullscreen()); } });
+#ifdef _WIN32
+		p.items.push_back({ tr::D_FS_MODE, tr::D_FS_MODE_HELP,
+			[&] { return std::string(fs_borderless() ? tr::D_BORDERLESS : tr::D_STANDARD); },
+			[&](int) {
+				const bool was = is_fullscreen();
+				if (was) set_fullscreen(false);
+				cfg.fs_exclusive = fs_borderless(); cfg_dirty = true;
+				if (was) set_fullscreen(true);
+				menu.refresh();
+			} });
+#endif
+		p.items.push_back({ tr::D_HUD, tr::D_HUD_HELP,
+			[&] { return on_off(cfg.hud); },
+			[&](int) { cfg.hud = !cfg.hud; cfg_dirty = true; m.set_hud_hidden(!cfg.hud); redraw_shown(); } });
+		p.items.push_back({ tr::D_SHOW_FPS, tr::D_SHOW_FPS_HELP,
+			[&] { return on_off(cfg.show_fps); },
+			[&](int) { cfg.show_fps = !cfg.show_fps; cfg_dirty = true; if (!cfg.show_fps) menu.set_fps(""); } });
+		if (on_screen_row())
+			p.items.push_back({ tr::D_ON_SCREEN, tr::D_ON_SCREEN_HELP,
+				[&] { return std::string(cfg.on_screen == 0 ? tr::OFF : cfg.on_screen == 2 ? tr::ON : tr::D_ON_SCREEN_AUTO); },
+				[&](int d) { cfg.on_screen = wrap(cfg.on_screen + d, 3); cfg_dirty = true; if (!touch_shown()) touch.release(); } });
+		p.items.push_back(back_item());
+		return p;
+	};
+	auto quality_page = [&] {
+		menu_page p{ tr::D_QUALITY, "", {} };
 		p.items.push_back({ tr::D_SCALE, tr::D_SCALE_HELP,
 			[&] { return scale < scale_wanted ? tr::fill(tr::D_SCALE_NARROWER, { { "n", std::to_string(scale) }, { "want", std::to_string(scale_wanted) } }) : x_n(scale); },
 			[&](int d) { set_scale(std::clamp(scale_wanted + d, 1, MAX_SCALE)); } });
@@ -3397,9 +3519,6 @@ int main(int argc, char **argv)
 				g3_decide("the player's GPU quality", true);
 				redraw_shown();
 			} });
-		p.items.push_back({ tr::D_SHAPE, tr::D_SHAPE_HELP,
-			[&] { return std::string(aspect_i ? ASPECT_NAMES[aspect_i] : tr::D_SHAPE_FIT.c_str()); },
-			[&](int d) { set_shape(wrap(aspect_i + d, N_ASPECTS)); } });
 		p.items.push_back({ tr::D_BG_FILTER, tr::D_BG_FILTER_HELP,
 			[&] { return std::string(cfg.smooth_bg ? tr::D_SMOOTH : tr::OFF); },
 			[&](int) {
@@ -3410,29 +3529,6 @@ int main(int argc, char **argv)
 		p.items.push_back({ tr::D_SMOOTH_MOTION, tr::D_SMOOTH_MOTION_HELP,
 			[&] { return on_off(cfg.smooth); },
 			[&](int) { cfg.smooth = !cfg.smooth; cfg_dirty = true; gov_fresh(); } });   // (the picture on show stays)
-		p.items.push_back({ tr::D_SCREEN_FILTER, tr::D_SCREEN_FILTER_HELP,
-			[&] { const tr::text names[] = { tr::OFF, tr::D_SCANLINES, tr::D_CRT }; return std::string(names[cfg.filter]); },
-			[&](int d) { cfg.filter = wrap(cfg.filter + d, 3); cfg_dirty = true; } });
-		p.items.push_back({ tr::D_CRT_COLOURS, tr::D_CRT_COLOURS_HELP,
-			[&] {
-				const tr::text names[] = { tr::OFF, tr::CRT_SEGA, tr::CRT_SONY, tr::CRT_NTSC_JP, tr::CRT_NTSC_US, tr::CRT_PAL };
-				static_assert(sizeof names / sizeof names[0] == crt::N_PRESETS, "a name for each of crt::PRESETS");
-				const std::string n = names[cfg.crt_colours];
-				return crt_on && crt_paint.failed() ? tr::fill(tr::NOT_WITH_RENDERER, { { "what", n } }) : n;
-			},
-			[&](int d) { cfg.crt_colours = wrap(cfg.crt_colours + d, crt::N_PRESETS); cfg_dirty = true; } });
-		p.items.push_back({ tr::D_BRIGHTNESS, tr::D_BRIGHTNESS_HELP,
-			[&] { const std::string n = tr::fill(tr::N_PERCENT, { { "n", std::to_string(cfg.brightness) } }); return crt_on && crt_paint.failed() ? tr::fill(tr::NOT_WITH_RENDERER, { { "what", n } }) : n; },
-			[&](int d) { cfg.brightness = std::clamp(cfg.brightness + 5 * d, crt::BRIGHT_MIN, crt::BRIGHT_MAX); cfg_dirty = true; } });
-		p.items.push_back({ tr::D_GAMMA, tr::D_GAMMA_HELP,
-			[&] { const std::string n = tr::fill(tr::N_PERCENT, { { "n", std::to_string(cfg.gamma) } }); return crt_on && crt_paint.failed() ? tr::fill(tr::NOT_WITH_RENDERER, { { "what", n } }) : n; },
-			[&](int d) { cfg.gamma = std::clamp(cfg.gamma + 5 * d, crt::GAMMA_MIN, crt::GAMMA_MAX); cfg_dirty = true; } });
-		p.items.push_back({ tr::D_SHOW_FPS, tr::D_SHOW_FPS_HELP,
-			[&] { return on_off(cfg.show_fps); },
-			[&](int) { cfg.show_fps = !cfg.show_fps; cfg_dirty = true; if (!cfg.show_fps) menu.set_fps(""); } });
-		p.items.push_back({ tr::D_HUD, tr::D_HUD_HELP,
-			[&] { return on_off(cfg.hud); },
-			[&](int) { cfg.hud = !cfg.hud; cfg_dirty = true; m.set_hud_hidden(!cfg.hud); redraw_shown(); } });
 		{
 			int now = 0;
 			if (SDL_GetRenderVSync(ren, &now))
@@ -3467,33 +3563,86 @@ int main(int argc, char **argv)
 				[&] { return on_off(cfg.perf_hints); },
 				[&](int) { cfg.perf_hints = !cfg.perf_hints; cfg_dirty = true; apply_perf_hints(); } });
 #endif
-#if !defined(__ANDROID__)
-		p.items.push_back({ tr::D_WINDOW_SIZE, tr::D_WINDOW_SIZE_HELP,
+		p.items.push_back(back_item());
+		return p;
+	};
+	auto screen_page = [&] {
+		menu_page p{ tr::D_SCREEN, "", {} };
+		p.items.push_back({ tr::D_SCREEN_FILTER, tr::D_SCREEN_FILTER_HELP,
+			[&] { const tr::text names[] = { tr::OFF, tr::D_SCANLINES, tr::D_CRT }; return std::string(names[cfg.filter]); },
+			[&](int d) { cfg.filter = wrap(cfg.filter + d, 3); cfg_dirty = true; } });
+		p.items.push_back({ tr::D_CRT_COLOURS, tr::D_CRT_COLOURS_HELP,
 			[&] {
-				if (cfg.window_scale <= 0) return std::string(tr::D_FREE);
-				int w, h;
-				window_target(cfg.window_scale, w, h);
-				return tr::fill(is_fullscreen() ? tr::D_WINDOW_N_IN_WINDOW : tr::D_WINDOW_N, { { "n", std::to_string(cfg.window_scale) }, { "w", std::to_string(w) }, { "h", std::to_string(h) } });
+				const tr::text names[] = { tr::OFF, tr::CRT_SEGA, tr::CRT_SONY, tr::CRT_NTSC_JP, tr::CRT_NTSC_US, tr::CRT_PAL };
+				static_assert(sizeof names / sizeof names[0] == crt::N_PRESETS, "a name for each of crt::PRESETS");
+				const std::string n = names[cfg.crt_colours];
+				return n;
 			},
-			[&](int d) { set_window_scale(wrap(cfg.window_scale + d, window_scale_most() + 1)); } });
+			[&](int d) { cfg.crt_colours = wrap(cfg.crt_colours + d, crt::N_PRESETS); cfg_dirty = true; } });
+		p.items.push_back({ tr::D_BRIGHTNESS, tr::D_BRIGHTNESS_HELP,
+			[&] { return tr::fill(tr::N_PERCENT, { { "n", std::to_string(cfg.brightness) } }); },
+			[&](int d) { cfg.brightness = std::clamp(cfg.brightness + 5 * d, crt::BRIGHT_MIN, crt::BRIGHT_MAX); cfg_dirty = true; } });
+		p.items.push_back({ tr::D_GAMMA, tr::D_GAMMA_HELP,
+			[&] { return tr::fill(tr::N_PERCENT, { { "n", std::to_string(cfg.gamma) } }); },
+			[&](int d) { cfg.gamma = std::clamp(cfg.gamma + 5 * d, crt::GAMMA_MIN, crt::GAMMA_MAX); cfg_dirty = true; } });
+		// (a renderer that can't paint them: said under each of the three, their values as set)
+		for (size_t i = 1; i < p.items.size(); i++)
+			p.items[i].below = [&] { return crt_on && crt_paint.failed() ? std::string(tr::D_NOT_WITH_RENDERER) : std::string(); };
+		p.items.push_back(back_item());
+		return p;
+	};
+	// (a list as a sentence has it, in the language: the pages' helps name their rows, the summaries their parts)
+	auto listed = [](std::initializer_list<std::string> parts) {
+		std::string out;
+		for (const std::string &x : parts) if (!x.empty()) out = out.empty() ? x : tr::fill(tr::LIST_PAIR, { { "a", out }, { "b", x } });
+		return out;
+	};
+	auto display_page = [&] {
+		menu_page p{ tr::P_DISPLAY, "", {} };
+		// Picture: its shape, and fullscreen or the window's size ("16:9, Fullscreen", "4:3, Window 2x")
+		p.items.push_back({ tr::D_PICTURE,
+			listed({ tr::D_SHAPE,
+#if !defined(__ANDROID__)
+				tr::D_WINDOW_SIZE,
 #endif
-		p.items.push_back({ tr::D_FULLSCREEN, tr::D_FULLSCREEN_HELP,
-			[&] { return on_off(is_fullscreen()); },
-			[&](int) { set_fullscreen(!is_fullscreen()); } });
+				tr::D_FULLSCREEN,
 #ifdef _WIN32
-		p.items.push_back({ tr::D_FS_MODE, tr::D_FS_MODE_HELP,
-			[&] { return std::string(fs_borderless() ? tr::D_BORDERLESS : tr::D_STANDARD); },
-			[&](int) {
-				const bool was = is_fullscreen();
-				if (was) set_fullscreen(false);
-				cfg.fs_exclusive = fs_borderless(); cfg_dirty = true;
-				if (was) set_fullscreen(true);
-				menu.refresh();
-			} });
+				tr::D_FS_MODE,
 #endif
-		p.items.push_back({ tr::D_ON_SCREEN, tr::D_ON_SCREEN_HELP,
-			[&] { return std::string(cfg.on_screen == 0 ? tr::OFF : cfg.on_screen == 2 ? tr::ON : tr::D_ON_SCREEN_AUTO); },
-			[&](int d) { cfg.on_screen = wrap(cfg.on_screen + d, 3); cfg_dirty = true; if (!touch_shown()) touch.release(); } });
+				tr::D_HUD, tr::D_SHOW_FPS, on_screen_row() ? std::string(tr::D_ON_SCREEN) : std::string() }),
+			[&] {
+				return listed({ std::string(aspect_i ? ASPECT_NAMES[aspect_i] : tr::D_SUM_FIT.c_str()),
+				                is_fullscreen() ? std::string(tr::D_FULLSCREEN)
+				                : cfg.window_scale > 0 ? tr::fill(tr::D_SUM_WINDOW_N, { { "n", std::to_string(cfg.window_scale) } }) : std::string(tr::D_SUM_WINDOW) });
+			}, {}, [&] { menu.push(picture_page()); } });
+		// Quality: the render scale, the antialiasing in use if any, and the 3D renderer drawing ("3x, AA 2x, GPU")
+		p.items.push_back({ tr::D_QUALITY,
+			listed({ tr::D_SCALE, tr::D_AA, tr::D_RENDERER,
+#ifdef _WIN32
+				tr::D_DRIVER,
+#endif
+				g3.dev && !strcmp(g3.dev->name(), "metal") ? std::string(tr::D_GPU_QUALITY) : std::string(),
+				tr::D_BG_FILTER, tr::D_SMOOTH_MOTION, tr::D_VSYNC, tr::D_FRAME_LIMIT,
+				SDL_GetRendererName(ren) && !strcmp(SDL_GetRendererName(ren), "gpu") ? std::string(tr::D_FRAMES_IN_FLIGHT) : std::string(),
+#if defined(__ANDROID__)
+				sysinfo::perf_hints_available() ? std::string(tr::D_PERF_HINTS) : std::string(),
+#endif
+				}),
+			[&] {
+				const int k = aa_now();
+				return listed({ x_n(scale),
+				                aa == 0 ? tr::fill(tr::D_SUM_AA, { { "n", std::string(tr::D_AA_LOW) } }) : k > 1 ? tr::fill(tr::D_SUM_AA, { { "n", x_n(k) } }) : std::string(),
+				                std::string(g3.on ? tr::R3D_GPU : tr::R3D_CPU) });
+			}, {}, [&] { menu.push(quality_page()); } });
+		// Screen filter and colours: the filter, and the CRT colours if on ("Scanlines", "Off, CRT colours")
+		p.items.push_back({ tr::D_SCREEN, listed({ tr::D_SCREEN_FILTER, tr::D_CRT_COLOURS, tr::D_BRIGHTNESS, tr::D_GAMMA }),
+			[&] {
+				const tr::text names[] = { tr::OFF, tr::D_SCANLINES, tr::D_CRT };
+				return listed({ std::string(names[cfg.filter]), cfg.crt_colours ? std::string(tr::D_CRT_COLOURS) : std::string() });
+			}, {}, [&] { menu.push(screen_page()); } });
+		p.items.push_back({ tr::D_FREECAM, tr::D_FREECAM_HELP,
+			[&] { return fc_blocked() ? std::string(tr::D_FREECAM_NOT_ONLINE) : on_off(fc_menu); },
+			[&](int) { if (fc_blocked()) menu.toast(tr::FREECAM_NOT_ONLINE); else fc_menu = !fc_menu; } });   // (on or off as the menu closes; in a match of the player's own, the toast)
 		p.items.push_back(back_item());
 		return p;
 	};
@@ -3753,9 +3902,16 @@ int main(int argc, char **argv)
 	// (slot 0 a control's key or button, 1 its second: Controls > Second keys, Second pad buttons)
 	auto key_of = [&](int p, int slot, int a) -> SDL_Scancode & { return slot ? cfg.ctl[p].key2[a] : cfg.ctl[p].key[a]; };
 	auto pad_of = [&](int p, int slot, int a) -> int & { return slot ? cfg.ctl[p].pad2[a] : cfg.ctl[p].pad[a]; };
-	auto keys_page = [&](int p, int slot) {
-		menu_page pg{ slot ? (p ? tr::P_P2_KEYBOARD2 : tr::P_P1_KEYBOARD2) : (p ? tr::P_P2_KEYBOARD : tr::P_P1_KEYBOARD), "", {} };
-		for (int a = 0; a < C_COUNT; a++)
+	// A player's keys: the directions, the buttons, Start, Coin and Menu; the four combinations (Guard + Punch and
+	// the rest) on a page of their own from it, Button combinations (14 rows and Back were more than a page's 14)
+	std::function<menu_page(int, int, bool)> keys_page = [&](int p, int slot, bool combos) {
+		menu_page pg{ combos ? tr::CTL_COMBOS : slot ? (p ? tr::P_P2_KEYBOARD2 : tr::P_P1_KEYBOARD2) : (p ? tr::P_P2_KEYBOARD : tr::P_P1_KEYBOARD), "", {} };
+		for (int a = 0; a < C_COUNT; a++) {
+			const bool combo = a >= C_GUARD_PUNCH && a <= C_ALL_THREE;
+			if (!combos && a == C_GUARD_PUNCH)
+				pg.items.push_back({ tr::CTL_COMBOS, tr::fill(tr::CTL_COMBOS_HELP, { { "list", listed({ control_name(C_GUARD_PUNCH), control_name(C_PUNCH_KICK), control_name(C_GUARD_KICK), control_name(C_ALL_THREE) }) } }),
+					{}, {}, [&, p, slot] { menu.push(keys_page(p, slot, true)); } });
+			if (combo != combos) continue;
 			pg.items.push_back({ control_name(a), a == C_COIN ? tr::CTL_KEY_HELP_COIN : a == C_MENU ? tr::CTL_KEY_HELP_MENU : tr::CTL_KEY_HELP,
 				[&, p, slot, a] { return key_name(key_of(p, slot, a)); }, {},
 				[&, p, slot, a] {
@@ -3765,7 +3921,7 @@ int main(int argc, char **argv)
 							const SDL_Scancode k = e.key.scancode == SDL_SCANCODE_BACKSPACE || e.key.scancode == SDL_SCANCODE_DELETE ? SDL_SCANCODE_UNKNOWN : e.key.scancode;
 							// the game's own keys (pause, reset, the menu's shortcuts, the cabinet's coin and
 							// test buttons) stay theirs: wait for another key
-							static const SDL_Scancode RESERVED[] = { SDL_SCANCODE_P, SDL_SCANCODE_TAB, SDL_SCANCODE_F3,
+							static const SDL_Scancode RESERVED[] = { SDL_SCANCODE_P, SDL_SCANCODE_TAB, SDL_SCANCODE_F3, SDL_SCANCODE_F4,
 								SDL_SCANCODE_F5, SDL_SCANCODE_F6, SDL_SCANCODE_F9, SDL_SCANCODE_F11, SDL_SCANCODE_F12 };
 							for (SDL_Scancode r : RESERVED) if (k == r) return false;
 							for (const auto &sk : SYS_KEYS) if (k == sk.key) return false;
@@ -3776,6 +3932,7 @@ int main(int argc, char **argv)
 							return true;
 						});
 				}, false, [&, p, slot, a] { key_of(p, slot, a) = SDL_SCANCODE_UNKNOWN; cfg_dirty = true; } });
+		}
 		pg.items.push_back(back_item());
 		return pg;
 	};
@@ -4020,8 +4177,8 @@ int main(int argc, char **argv)
 		menu_page pg{ p ? tr::P_PLAYER_2 : tr::P_PLAYER_1, "", {} };
 		pg.items.push_back({ tr::CTL_PAD, tr::CTL_PAD_HELP,
 							 [&, p] { return pad_name(p); }, [&, p](int d) { cycle_pad(p, d); } });
-		pg.items.push_back({ tr::CTL_KEYBOARD, tr::CTL_KEYBOARD_HELP, {}, {}, [&, p] { menu.push(keys_page(p, 0)); } });
-		pg.items.push_back({ tr::CTL_KEYBOARD2, tr::CTL_KEYBOARD2_HELP, {}, {}, [&, p] { menu.push(keys_page(p, 1)); } });
+		pg.items.push_back({ tr::CTL_KEYBOARD, tr::CTL_KEYBOARD_HELP, {}, {}, [&, p] { menu.push(keys_page(p, 0, false)); } });
+		pg.items.push_back({ tr::CTL_KEYBOARD2, tr::CTL_KEYBOARD2_HELP, {}, {}, [&, p] { menu.push(keys_page(p, 1, false)); } });
 		pg.items.push_back({ tr::CTL_PAD_BUTTONS, tr::CTL_PAD_BUTTONS_HELP,
 							 {}, {}, [&, p] { menu.push(pad_buttons_page(p, 0)); } });
 		pg.items.push_back({ tr::CTL_PAD_BUTTONS2, tr::CTL_PAD_BUTTONS2_HELP,
@@ -4298,7 +4455,31 @@ int main(int argc, char **argv)
 		menu.push(game_page());
 		menu.select_row(row);
 	};
+	// (tests: VF2_TEST_FREECAM_PATH, the free camera flown along a path: free_cam_path.h; at the clock of the picture
+	// being set up, fc_path_clock: the hooks' clock, between two frames as far as the picture is)
+	freecam::Path fc_path;
+	double fc_path_clock = 0;
+	if (const char *pf = getenv("VF2_TEST_FREECAM_PATH")) {
+		if (!fc_path.load(pf)) fprintf(stderr, "(test) the free camera's path: %s\n", fc_path.error.c_str());
+		else {
+			fprintf(stderr, "(test) the free camera's path: %zu keys, %zu orbits, %zu events\n", fc_path.keys.size(), fc_path.orbits.size(), fc_path.events.size());
+			m.set_freecam_pilot([&](model2_video::freecam_pilot_state &st) { fc_path.fly(st, fc_path_clock); });
+		}
+	}
+	fc_blocked = [&] { return online.playing() && !online.watching(); };
+	set_freecam = [&](bool on, bool pad) {
+		if (on && fc_blocked()) { menu.toast(tr::FREECAM_NOT_ONLINE); fc_menu = false; return; }
+		fc_menu = on;
+		if (on == freecam) return;
+		freecam = on;
+		m.set_freecam(on);
+		fc_speed = 1;
+		if (on && !fc_path.no_toast) menu.toast(pad ? tr::FREECAM_ON_PAD : tr::FREECAM_ON_KEYS);
+		if (paused && !on && shown_pic) redraw_shown();   // (paused: the picture on show from the game's camera again)
+		fprintf(stderr, "free camera: %s\n", on ? "on" : "off");
+	};
 	auto open_menu = [&] {
+		fc_menu = freecam;
 		touch.release();
 		finish_async(false);
 		menu.set_title(menu_title());
@@ -4662,6 +4843,124 @@ int main(int argc, char **argv)
 			for (int a = 0; a < C_COUNT; a++) if (c.key[a] == SDL_SCANCODE_F || c.key2[a] == SDL_SCANCODE_F) return false;   // (first or second)
 		return true;
 	};
+	// The free camera each pass: flown by the time passed (the keys held, the mouse's moves the events gathered, the
+	// pads), View + R3 on any pad turning it on and off, off as an online match is played; the mouse captured while
+	// it's flown (not with the menu open, nor the window out of focus). And VF2_TEST_FREECAM's steps.
+	float fc_mouse[2] = { 0, 0 };
+	uint64_t fc_t = SDL_GetTicksNS(), fc_clock_stopped = 0;
+	struct fc_step { uint64_t at; std::string what, arg; };
+	std::vector<fc_step> fc_steps;
+	if (const char *t = getenv("VF2_TEST_FREECAM")) {
+		std::string all = t;
+		for (size_t i = 0; i < all.size();) {
+			size_t j = all.find(',', i);
+			// (a move's own commas: its three numbers)
+			std::string item = all.substr(i, j == std::string::npos ? std::string::npos : j - i);
+			if (item.rfind("move@", 0) == 0) for (int k = 0; k < 2 && j != std::string::npos; k++) j = all.find(',', j + 1);
+			item = all.substr(i, j == std::string::npos ? std::string::npos : j - i);
+			const size_t at = item.find('@'), eq = item.find('=');
+			if (at != std::string::npos)
+				fc_steps.push_back({ uint64_t(atoll(item.c_str() + at + 1)), item.substr(0, at), eq == std::string::npos ? "" : item.substr(eq + 1) });
+			if (j == std::string::npos) break;
+			i = j + 1;
+		}
+	}
+	auto freecam_pass = [&] {
+		const uint64_t now = SDL_GetTicksNS();
+		const double dt = std::clamp(double(now - fc_t) / 1e9, 0.0, 0.1);
+		fc_t = now;
+		static bool combo_was[2], y_was[2], lb_was[2], rb_was[2];
+		for (int p = 0; p < 2; p++) {
+			SDL_Gamepad *g = pads[p];
+			const bool combo = g && SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_BACK) && SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_RIGHT_STICK);
+			if (combo && !combo_was[p] && !menu.is_open()) set_freecam(!freecam, true);
+			combo_was[p] = combo;
+		}
+		if (freecam && fc_blocked()) set_freecam(false, false);   // (an online match being played: off)
+		const bool fly = freecam && !menu.is_open() && !suspended;
+		const bool focus = !hidden && SDL_GetKeyboardFocus() == win;
+		if (SDL_GetWindowRelativeMouseMode(win) != (fly && focus)) SDL_SetWindowRelativeMouseMode(win, fly && focus);
+		if (fly) {
+			constexpr double MOUSE = 0.12, ARROWS = 90, STICK = 120;   // (degrees a pixel; a second)
+			double fwd = 0, right = 0, up = 0, mul = 1;
+			double yaw = fc_mouse[0] * MOUSE, pitch = -fc_mouse[1] * MOUSE;
+			if (focus) {
+				const bool *ks = SDL_GetKeyboardState(nullptr);
+				fwd += ks[SDL_SCANCODE_W] - ks[SDL_SCANCODE_S];
+				right += ks[SDL_SCANCODE_D] - ks[SDL_SCANCODE_A];
+				up += (ks[SDL_SCANCODE_E] || ks[SDL_SCANCODE_SPACE]) - (ks[SDL_SCANCODE_Q] || ks[SDL_SCANCODE_LCTRL] || ks[SDL_SCANCODE_RCTRL]);
+				if (ks[SDL_SCANCODE_LSHIFT] || ks[SDL_SCANCODE_RSHIFT]) mul *= 4;
+				if (ks[SDL_SCANCODE_LALT] || ks[SDL_SCANCODE_RALT]) mul *= 0.25;
+				yaw += ARROWS * dt * (ks[SDL_SCANCODE_RIGHT] - ks[SDL_SCANCODE_LEFT]);
+				pitch += ARROWS * dt * (ks[SDL_SCANCODE_UP] - ks[SDL_SCANCODE_DOWN]);
+			}
+			for (int p = 0; p < 2; p++) {
+				SDL_Gamepad *g = pads[p];
+				if (!g || (p == 1 && pads[1] == pads[0])) continue;
+				auto axis = [&](SDL_GamepadAxis a) {   // (a dead zone of 0.15, then squared)
+					const double v = std::clamp(SDL_GetGamepadAxis(g, a) / 32767.0, -1.0, 1.0), m = (std::fabs(v) - 0.15) / 0.85;
+					return m <= 0 ? 0.0 : std::copysign(m * m, v);
+				};
+				auto btn = [&](SDL_GamepadButton b) { return SDL_GetGamepadButton(g, b); };
+				fwd -= axis(SDL_GAMEPAD_AXIS_LEFTY);
+				right += axis(SDL_GAMEPAD_AXIS_LEFTX);
+				up += axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) - axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+				yaw += STICK * dt * axis(SDL_GAMEPAD_AXIS_RIGHTX);
+				pitch -= STICK * dt * axis(SDL_GAMEPAD_AXIS_RIGHTY);
+				if (btn(SDL_GAMEPAD_BUTTON_LEFT_STICK)) mul *= 4;
+				const bool lb = btn(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER), rb = btn(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER), y = btn(SDL_GAMEPAD_BUTTON_NORTH);
+				if (lb && !lb_was[p]) fc_speed = std::max(fc_speed / 1.25, 1.0 / 16);
+				if (rb && !rb_was[p]) fc_speed = std::min(fc_speed * 1.25, 16.0);
+				if (y && !y_was[p]) m.freecam_reset();
+				lb_was[p] = lb; rb_was[p] = rb; y_was[p] = y;
+			}
+			fwd = std::clamp(fwd, -1.0, 1.0); right = std::clamp(right, -1.0, 1.0); up = std::clamp(up, -1.0, 1.0);
+			// (a ring's width in about 3 s at the speed's start)
+			const double step = m.freecam_unit() / 3 * fc_speed * mul * dt;
+			if (fwd || right || up || yaw || pitch) m.freecam_fly(float(fwd * step), float(right * step), float(up * step), float(yaw), float(pitch));
+		}
+		fc_mouse[0] = fc_mouse[1] = 0;
+		// (tests)
+		const bool stopped_now = suspended || (!online.playing() && (paused || menu.is_open() || online.starting()));
+		if (stopped_now) fc_clock_stopped++;
+		const uint64_t clock = game_frame + fc_clock_stopped;
+		if (fc_path.loaded) {
+			m.freecam_fighters();   // (where the fighters are, for the path's picture: read only)
+			for (freecam::Path::Event &e : fc_path.events) {
+				if (e.done || double(clock) < e.t) continue;
+				e.done = true;
+				fprintf(stderr, "(test) the free camera's path: %s at %llu (frame %llu)\n", e.what.c_str(), (unsigned long long)clock, (unsigned long long)game_frame);
+				if (e.what == "on") set_freecam(true, false);
+				else if (e.what == "off") set_freecam(false, false);
+				else if (e.what == "pause") paused = true;
+				else if (e.what == "unpause") paused = false;
+				else if (e.what == "quit") running = false;
+			}
+		}
+		while (!fc_steps.empty() && clock >= fc_steps.front().at) {
+			const fc_step st = fc_steps.front();
+			fc_steps.erase(fc_steps.begin());
+			const double v = atof(st.arg.c_str()), u = m.freecam_unit();
+			fprintf(stderr, "test: free camera: %s %s at frame %llu (clock %llu)\n", st.what.c_str(), st.arg.c_str(), (unsigned long long)game_frame, (unsigned long long)clock);
+			if (st.what == "on") set_freecam(true, false);
+			else if (st.what == "off") set_freecam(false, false);
+			else if (st.what == "reset") m.freecam_reset();
+			else if (st.what == "yaw") m.freecam_fly(0, 0, 0, float(v), 0);
+			else if (st.what == "pitch") m.freecam_fly(0, 0, 0, 0, float(v));
+			else if (st.what == "move") {
+				double f = 0, r = 0, up = 0;
+				sscanf(st.arg.c_str(), "%lf,%lf,%lf", &f, &r, &up);
+				m.freecam_fly(float(f * u), float(r * u), float(up * u), 0, 0);
+			} else if (st.what == "pause") paused = true;
+			else if (st.what == "resume") paused = false;
+			else if (st.what == "shot") {
+				std::vector<uint32_t> px;
+				int w = 0, h = 0;
+				shown_pixels(px, w, h);
+				write_png(("build/host_fc_" + st.arg + ".png").c_str(), px.data(), w, h);
+			}
+		}
+	};
 	while (running) {
 		const int64_t pass = passes++;
 		marker_done(false);
@@ -4846,14 +5145,18 @@ int main(int argc, char **argv)
 				menu.refresh();
 				if (SDL_GetKeyboardFocus() != win) SDL_RaiseWindow(win);   // (the move to a new Space can lose it)
 			}
+			else if (e.type == SDL_EVENT_MOUSE_MOTION && freecam && SDL_GetWindowRelativeMouseMode(win)) { fc_mouse[0] += e.motion.xrel; fc_mouse[1] += e.motion.yrel; }
+			else if (e.type == SDL_EVENT_MOUSE_WHEEL && freecam) fc_speed = std::clamp(fc_speed * std::pow(1.25, double(e.wheel.y)), 1.0 / 16, 16.0);
 			else if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
 				if (e.key.scancode == SDL_SCANCODE_ESCAPE) open_menu();
+				else if (e.key.scancode == SDL_SCANCODE_F4) set_freecam(!freecam, false);
+				else if (e.key.scancode == SDL_SCANCODE_R && freecam) m.freecam_reset();
 				else if (e.key.scancode == SDL_SCANCODE_P && !online.playing()) paused = !paused;   // (a match never pauses)
 				else if (e.key.scancode == SDL_SCANCODE_F9) {
 					timings = !timings; cfg_dirty = true;
 					if (!timings) SDL_SetWindowTitle(win, title_base);
 				}
-				else if (e.key.scancode == SDL_SCANCODE_F3) reset_game();
+				else if (e.key.scancode == SDL_SCANCODE_F3 && !online.playing()) reset_game();   // (never in a match)
 				else if (e.key.scancode == SDL_SCANCODE_F5) set_scale(scale_wanted % MAX_SCALE + 1);
 				else if (e.key.scancode == SDL_SCANCODE_F6) set_shape((aspect_i + 1) % N_ASPECTS);
 				else if (e.key.scancode == SDL_SCANCODE_F11 || fullscreen_key(e.key)) set_fullscreen(!is_fullscreen());
@@ -4873,7 +5176,9 @@ int main(int argc, char **argv)
 		}
 		setup_poll();
 		sync_menu_sound();
+		freecam_pass();
 		if ((menu.is_open() != menu_was_open && !menu.is_open()) || std::exchange(menu_closed_elsewhere, false)) {
+			if (fc_menu != freecam) set_freecam(fc_menu, false);   // (Display > Free camera's choice)
 			// (not a match just left from the menu: Leave closes it before end_match has shown MATCH OVER, which it then didn't)
 			if (online.phase() == Online::Phase::off && !match_on) { online.set_last_match({}); online.forget_failure(); }   // (MATCH OVER, COULDN'T CONNECT: just after, not for ever)
 			log_state("the menu closed");
@@ -4908,6 +5213,30 @@ int main(int argc, char **argv)
 		const uint64_t work_t0 = SDL_GetTicksNS();
 		bool sound_full = false;   // over 300 ms queued: no frames run this pass
 		if (stopped) restart_clock();
+		else if (!rec.dir.empty()) {
+			// the recording: before it starts, frames as fast as they go (no pictures); then 60 pictures a second by the
+			// game's clock
+			if (!rec.on && game_frame >= rec.from) {
+				rec.on = true;
+				rec.from = game_frame;
+				rec.base = frames_run;
+				int ww = 0, wh = 0;
+				SDL_GetCurrentRenderOutputSize(ren, &ww, &wh);
+				rec.w = ww & ~1; rec.h = wh & ~1;
+				const std::string cmd = "ffmpeg -loglevel error -y -f rawvideo -pix_fmt rgba -s " + std::to_string(rec.w) + "x" + std::to_string(rec.h) +
+				                        " -r " + std::to_string(rec.hz) + " -i - -c:v libx264 -preset slow -crf 12 -pix_fmt yuv420p '" + rec.dir + "/video.mp4'";
+				rec.video = popen(cmd.c_str(), "w");
+				rec.wav = fopen((rec.dir + "/sound.wav").c_str(), "wb");
+				if (rec.wav) wav_header();
+				fprintf(stderr, "record: from frame %llu, %dx%d\n", (unsigned long long)rec.from, rec.w, rec.h);
+			}
+			if (!rec.on) { due = 8; frame_clock = double(frames_run + due); }
+			else {
+				frame_clock = double(rec.base) + double(rec.n - rec.stopped_n + 1) * FRAME_HZ / double(rec.hz);
+				due = std::max(0, int(int64_t(std::floor(frame_clock)) - int64_t(frames_run)));
+			}
+			frames_run += due;
+		}
 		else {
 			// how many frames to run now
 			const uint64_t now_ns = SDL_GetTicksNS();
@@ -4994,6 +5323,7 @@ int main(int argc, char **argv)
 			script.apply(game_frame, ports);
 			uint8_t live[3];
 			const hotkey hk = read_inputs(m, pads, pstate, cfg.ctl, live, touch_shown() ? &touch : nullptr);
+			if (freecam) live[0] = live[1] = live[2] = 0;   // (the free camera's: the players' own inputs kept from the game)
 			m.m_in0 = ports[input_script::IN0] & ~live[0];
 			m.m_in1 = ports[input_script::IN1] & ~live[1];
 			m.m_in2 = ports[input_script::IN2] & ~live[2];
@@ -5001,15 +5331,20 @@ int main(int argc, char **argv)
 			auto [shot_first, shot_last] = script.shots.equal_range(game_frame);
 			for (auto it = shot_first; it != shot_last; ++it)
 				write_png(("build/host_" + it->second + ".png").c_str(), picture->data(), picture->width(), picture->height());
-			if (audio && !ff && !m.m_audio_out.empty()) {
+			if (rec.wav && rec.on && !m.m_audio_out.empty()) {   // (a recording's: to its file)
+				fwrite(m.m_audio_out.data(), sizeof(int16_t), m.m_audio_out.size(), rec.wav);
+				rec.wav_bytes += uint32_t(m.m_audio_out.size() * sizeof(int16_t));
+			}
+			if (audio && !ff && !m.m_audio_out.empty() && rec.dir.empty()) {
 				SDL_PutAudioStreamData(audio, m.m_audio_out.data(), int(m.m_audio_out.size() * sizeof(int16_t)));
 			}
 			m.m_audio_out.clear();
 			game_frame++;
-			// (tests: the game's work RAM hashed every 30 frames, VF2_TEST_RAM_LOG=file: the game the same whatever the
+			// (tests: the game's work RAM hashed every 30 frames, with the polygon counts it read, VF2_TEST_RAM_LOG=file: the game the same whatever the
 			// display's settings, Display > HUD's, V-Sync's, the frame limit's)
 			if (static FILE *rl = getenv("VF2_TEST_RAM_LOG") ? fopen(getenv("VF2_TEST_RAM_LOG"), "w") : nullptr; rl && game_frame % 30 == 0) {
-				fprintf(rl, "%llu %016llx\n", (unsigned long long)game_frame, (unsigned long long)fnv(m.workram().data(), m.workram().size()));
+				fprintf(rl, "%llu %016llx %016llx\n", (unsigned long long)game_frame, (unsigned long long)fnv(m.workram().data(), m.workram().size()),
+					(unsigned long long)m.video().m_polygon_count_sum);   // (and every polygon count the game read from the 3D so far)
 				fflush(rl);
 			}
 			if (pace_log && game_frame % 60 == 0)
@@ -5041,7 +5376,7 @@ int main(int argc, char **argv)
 				uint8_t live[3];
 				const hotkey hk = read_inputs(m, pads, pstate, cfg.ctl, live, touch_shown() ? &touch : nullptr);
 				const uint8_t in0 = uint8_t(ports[input_script::IN0] & ~live[0]), in1 = uint8_t(ports[input_script::IN1] & ~live[1]), in2 = uint8_t(ports[input_script::IN2] & ~live[2]);
-				const uint16_t bits = menu.is_open() ? 0 : uint16_t(vf2net::pack(in0, in1, 0) | vf2net::pack(in0, in2, 1) | step_carry);
+				const uint16_t bits = menu.is_open() || freecam ? 0 : uint16_t(vf2net::pack(in0, in1, 0) | vf2net::pack(in0, in2, 1) | step_carry);
 				online.poll(double(SDL_GetTicksNS()) / 1e6);
 				if (hk == hotkey::menu) open_menu();
 				const uint64_t te = SDL_GetTicksNS();
@@ -5073,7 +5408,7 @@ int main(int argc, char **argv)
 		if (vsync_now != 0 && picture_cap >= screen_rate * 0.95) picture_cap = std::max(picture_cap, screen_rate + 1.0);
 		if (smooth_limit) picture_cap = std::min(picture_cap, 60.0);
 		const bool capped_low = picture_cap < FRAME_HZ * 0.95;
-		const bool frame_picture = !capped_low || smooth_budget >= 1 || stopped;
+		const bool frame_picture = (!capped_low || smooth_budget >= 1 || stopped) && (rec.dir.empty() || rec.on || pass % 60 == 0);   // (a recording not started yet: a picture only now and then)
 		if (online.playing() && !frame_picture) draw_into_texture = false;   // (a match's frames too, by the budget: as VF3's)
 		// the frame run during the last present: its picture drawn now, as if it had run here
 		const bool took_ahead = ahead.carried;   // (counted as a frame run in this pass, below)
@@ -5152,13 +5487,16 @@ int main(int argc, char **argv)
 			smooth_budget = std::min(2.0, smooth_budget + double(bt - smooth_budget_t) * picture_cap / 1e9);
 			smooth_budget_t = bt;
 			const bool unseen = !hidden && (SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED));
-			if (smooth_on() && !stopped && !ff && last_shown && !held && !unseen && (draw_into_texture || (due == 0 && !took_ahead && smooth_budget >= 1))) {
+			if (smooth_on() && !stopped && !ff && last_shown && !held && !unseen && (draw_into_texture || rec.on || (due == 0 && !took_ahead && smooth_budget >= 1))) {
 				smooth_now = true;
 				smooth_budget = std::max(0.0, smooth_budget - 1);
 				alpha = float(std::clamp(frame_clock - double(frames_run), 0.0, 1.0));
 				draw_into_texture = true;
 			} else if (draw_into_texture && capped_low) smooth_budget = std::max(0.0, smooth_budget - 1);   // (a frame's own picture, within the limit)
 		}
+		// (tests: the free camera's path, at this picture's time: the hooks' clock, between two frames as far as a smooth
+		// picture is; a paused game's, a tick a pass)
+		fc_path_clock = double(game_frame + fc_clock_stopped) + (smooth_now ? double(alpha) - 1 : 0.0);
 		// the 3D on the GPU (see gpu3d_state), the 2D's parts put together around it (gpu_picture)
 		if (draw_into_texture && g3.on && !g3.failed && g3_targets(m.width() * scale, model2a::HEIGHT * scale) && gpu_pic.ready(m.width(), scale)) {
 			const uint64_t td = SDL_GetTicksNS();
@@ -5320,6 +5658,7 @@ int main(int argc, char **argv)
 			if (scene_sync::is_blank(b)) show_drawn(b);
 			else pace.pictures++, pace.held++;   // (a picture held on purpose isn't one missed)
 		}
+		if (freecam && stopped && !menu.is_open() && !suspended && shown_pic) redraw_shown();   // (paused: the free camera still flies, a picture each pass)
 		if (new_picture) {
 			const uint64_t tu = SDL_GetTicksNS();
 			upload_picture(*picture);
@@ -5459,6 +5798,34 @@ int main(int argc, char **argv)
 				ahead_ns = SDL_GetTicksNS() - te;
 				ahead_waited = m.render_waited_ns() - waited;
 			});
+		}
+		if (rec.on && rec.video) {   // VF2_RECORD: the window's whole picture, a picture each pass
+			int lw, lh;
+			SDL_RendererLogicalPresentation mode;
+			SDL_GetRenderLogicalPresentation(ren, &lw, &lh, &mode);
+			SDL_SetRenderLogicalPresentation(ren, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+			if (SDL_Surface *sf = SDL_RenderReadPixels(ren, nullptr)) {
+				if (SDL_Surface *c = SDL_ConvertSurface(sf, SDL_PIXELFORMAT_ABGR8888)) {
+					for (int y = 0; y < rec.h && y < c->h; y++)
+						fwrite(static_cast<uint8_t *>(c->pixels) + size_t(y) * c->pitch, 4, size_t(rec.w), rec.video);
+					SDL_DestroySurface(c);
+				}
+				SDL_DestroySurface(sf);
+			}
+			SDL_SetRenderLogicalPresentation(ren, lw, lh, mode);
+			rec.n++;
+			if (stopped) {   // (a paused picture: the game's clock stands still, the sound silent for its time, in step)
+				rec.stopped_n++;
+				if (rec.wav) {
+					const uint64_t want = rec.stopped_n * uint64_t(model2a::SOUND_RATE) / uint64_t(rec.hz);
+					const std::vector<int16_t> zero(size_t(want - rec.silent) * 2, 0);
+					fwrite(zero.data(), sizeof(int16_t), zero.size(), rec.wav);
+					rec.wav_bytes += uint32_t(zero.size() * sizeof(int16_t));
+					rec.silent = want;
+				}
+			}
+			if (rec.n % (uint64_t(rec.hz) * 10) == 0) fprintf(stderr, "record: %.0f s\n", rec.n / double(rec.hz));
+			if (game_frame >= rec.to) running = false;
 		}
 		const uint64_t tp = SDL_GetTicksNS();
 		SDL_RenderPresent(ren);
@@ -5730,6 +6097,7 @@ int main(int argc, char **argv)
 	msound.stop();
 	online.stop();   // (closed in a match: the other side is told at once, not after a silence)
 	Online::flush(1500);   // (and the lobby told: a room closed, a search left)
+	rec_stop();
 	links::stopped(data);
 	if (g_match_board) {   // (this player's own NVRAM, not the host's, saved)
 		memcpy(m.backup_ram().data(), own_backup.data(), std::min(own_backup.size(), m.backup_ram().size()));

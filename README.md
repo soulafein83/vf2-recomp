@@ -23,11 +23,11 @@ recompiler, MAME's Model 2A board, the renderers and the desktop builds are upst
 the phone only. For everything else, from the desktop downloads to the controls and the credits, see the
 [upstream README](https://github.com/mr-finster/vf2-recomp#readme).
 
-The fork is based on upstream **v0.1.21**, which includes this Android port as experimental: online play
-(with rollback), the random fighters, the HUD flags, rooms and watching, 13 languages (Polish among them)
-and the rest of v0.1.19–v0.1.21 are in. On the phone **Online > Play by address** works (the same network,
-or a VPN). The lobby — rooms, room codes, Quick match and watching — needs libcurl, which Android doesn't
-ship, and this build carries no lobby address, so those pages say so; see
+The fork is based on upstream **v0.1.22**, which includes this Android port as experimental: online play
+(with rollback), the random fighters, the HUD flags, rooms and watching, 13 languages (Polish among them),
+the free camera and the rest of v0.1.19–v0.1.22 are in. On the phone **Online > Play by address** works
+(the same network, or a VPN). The lobby — rooms, room codes, Quick match and watching — needs libcurl,
+which Android doesn't ship, and this build carries no lobby address, so those pages say so; see
 [android/README.md](android/README.md).
 
 The port in more detail: [android/README.md](android/README.md) (the same instructions as below, for a
@@ -149,7 +149,7 @@ on the start-up test scene; an on-screen pad for player 2; and the 2D renderer's
 
 4. The APK is `android/app/build/outputs/apk/debug/app-debug.apk`, signed with the debug key (it installs by
    sideloading, not from the Play Store). Its `versionName` is `git describe` (a tag, or the tag and commit),
-   and its `versionCode` is that name's major.minor.patch (`10103` for `v1.1.3`), so each tagged build is an
+   and its `versionCode` is that name's major.minor.patch (`10104` for `v1.1.4`), so each tagged build is an
    upgrade.
 
 ## Run it, step by step
