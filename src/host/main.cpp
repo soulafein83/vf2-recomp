@@ -190,6 +190,8 @@
 //                        -1@300 an axis to one end (each 8 passes), q@900 quit (a run that saves), p@100 plugged
 //                        in then (not at the start); "1": no presses. Player 1's controls logged as they change
 //   VF2_TEST_RAM_LOG=f   the game's work RAM hashed every 30 game frames to f (a display setting changes no frame)
+//   VF2_TEST_RAM_DUMP=d  the game's work RAM to d/ram_<frame>.bin every 10 game frames (tests: finding a place)
+//   VF2_TEST_POKE=a=v@f  the work RAM's byte a (hex, from 0x500000) set to v (hex) at game frame f (tests)
 //   VF2_TEST_CHIME_WAV=f the match found chime's sound (the game's coin, made at the start) to f, a .wav
 #include "version.h"      // VF2_VERSION, VF2_DATE (made by the Makefile from git)
 #include "../machine/model2a.h"
@@ -900,6 +902,11 @@ struct settings
 	std::string random_player[2];   // Cheats: each player's fighter: "" the select as ever, "*" a random one each game, or a name's (model2a::set_random_player)
 	std::string random_named[2];    // (each player's last name typed: Left / Right come back to it)
 	bool random_cpu = false;        // Cheats: Random opponents, every computer opponent a random fighter
+	// Cheats > Fight switches (model2a::fight_cheats), offline only: never on an online match's board
+	int infinite_energy = 0;        // bit 0 player 1, bit 1 player 2
+	bool one_hit_ko = false, no_time_limit = false;
+	int ring_cheat = 0;             // 0 the game's (Arcade settings' Ring size), 1 tiny (650), 2 huge (5000: no ring outs)
+	int jacky_bird = 0;             // Jacky's stage's bird: 0 the arcade's code (both players), 1 one player's, 2 always
 	bool debug_mode = false;        // Arcade settings: Debug mode, the arcade's own (model2a::set_debug_mode), offline only
 	// settings.ini's version: 2 from v0.1.2 (none before), 3 from the GPU's failures forgotten once
 	// (v0.1.15) or the phone's fullscreen, 4 from Rounds to win (vs player) 3 (v0.1.17), 5 the same
@@ -1051,6 +1058,11 @@ struct settings
 			if (auto it = kv.find(p ? "random_p2_name" : "random_p1_name"); it != kv.end()) random_named[p] = trimmed(it->second);
 		}
 		flag("random_opponents", random_cpu);
+		num("infinite_energy", infinite_energy, 0, 3);
+		flag("one_hit_ko", one_hit_ko);
+		flag("no_time_limit", no_time_limit);
+		num("ring_cheat", ring_cheat, 0, 2);
+		num("jacky_bird", jacky_bird, 0, 2);
 		flag("debug_mode", debug_mode);
 		num("stage_select", stage, -1, vf2net::STAGES);
 		if (stage == 0) stage = -1;   // (the versus order's first: the game's own)
@@ -1133,6 +1145,11 @@ struct settings
 			if (!random_named[p].empty()) fprintf(f, "random_p%d_name = %s\n", p + 1, random_named[p].c_str());
 		}
 		if (random_cpu) fprintf(f, "random_opponents = 1\n");
+		if (infinite_energy) fprintf(f, "infinite_energy = %d\n", infinite_energy);
+		if (one_hit_ko) fprintf(f, "one_hit_ko = 1\n");
+		if (no_time_limit) fprintf(f, "no_time_limit = 1\n");
+		if (ring_cheat) fprintf(f, "ring_cheat = %d\n", ring_cheat);
+		if (jacky_bird) fprintf(f, "jacky_bird = %d\n", jacky_bird);
 		if (debug_mode) fprintf(f, "debug_mode = 1\n");
 		if (stage >= 0) fprintf(f, "stage_select = %d\n", stage);
 		fprintf(f, "crt_colours = %d\nbrightness = %d\ngamma = %d\n", crt_colours, brightness, gamma);
@@ -3759,6 +3776,31 @@ int main(int argc, char **argv)
 	auto kind_of = [&](int pl) { const std::string &v = cfg.random_player[pl]; return v.empty() ? 0 : v == "*" ? 1 : 2; };
 	static const tr::text KINDS[] = { tr::FIGHTER_NORMAL, tr::FIGHTER_RANDOM, tr::FIGHTER_SEED };
 	auto rebuild = [&](int pl, bool sub) { menu_page pg = cheats_page(); menu.replace(std::move(pg), sub && fighter_sub[pl] >= 0 ? fighter_sub[pl] : fighter_row[pl]); };
+	// Fight switches: a page of its own, as VF1's (Infinite energy, One-hit KO, No time limit, Ring). None restarts the
+	// game: each is written into the fight's RAM before each frame, offline only (an online match's board never)
+	auto fight_page = [&] {
+		menu_page p{ tr::C_FIGHT_SWITCHES, "", {} };
+		static const tr::text WHO[] = { tr::OFF, tr::P_PLAYER_1, tr::P_PLAYER_2, tr::C_BOTH };
+		p.items.push_back({ tr::C_INFINITE, tr::C_INFINITE_HELP,
+			[&] { return std::string(WHO[cfg.infinite_energy]); },
+			[&](int d) { cfg.infinite_energy = wrap(cfg.infinite_energy + d, 4); cfg_dirty = true; } });
+		p.items.push_back({ tr::C_ONE_HIT, tr::C_ONE_HIT_HELP,
+			[&] { return on_off(cfg.one_hit_ko); },
+			[&](int) { cfg.one_hit_ko = !cfg.one_hit_ko; cfg_dirty = true; } });
+		p.items.push_back({ tr::C_NO_TIME, tr::C_NO_TIME_HELP,
+			[&] { return on_off(cfg.no_time_limit); },
+			[&](int) { cfg.no_time_limit = !cfg.no_time_limit; cfg_dirty = true; } });
+		static const tr::text RING[] = { tr::C_RING_NORMAL, tr::C_RING_TINY, tr::C_RING_HUGE };
+		p.items.push_back({ tr::C_RING, tr::C_RING_HELP,
+			[&] { return std::string(RING[cfg.ring_cheat]); },
+			[&](int d) { cfg.ring_cheat = wrap(cfg.ring_cheat + d, 3); cfg_dirty = true; } });
+		static const tr::text BIRD[] = { tr::C_BIRD_CLASSIC, tr::C_BIRD_EASY, tr::C_BIRD_ALWAYS };
+		p.items.push_back({ tr::C_BIRD, tr::C_BIRD_HELP,
+			[&] { return std::string(BIRD[cfg.jacky_bird]); },
+			[&](int d) { cfg.jacky_bird = wrap(cfg.jacky_bird + d, 3); cfg_dirty = true; } });
+		p.items.push_back(back_item());
+		return p;
+	};
 	cheats_page = [&] {
 		if (!assign_before) assign_before = assignments_now();
 		menu_page p{ tr::P_CHEATS_PAGE, "", {} };
@@ -3836,6 +3878,10 @@ int main(int argc, char **argv)
 		p.items.push_back({ tr::C_RANDOM_CPU, tr::C_RANDOM_CPU_HELP,
 			[&] { return on_off(cfg.random_cpu); },
 			[&](int) { cfg.random_cpu = !cfg.random_cpu; cfg_dirty = true; } });   // (applied as the game restarts)
+		heading(tr::C_FIGHT_HEAD);
+		p.items.push_back({ tr::C_FIGHT_SWITCHES, listed({ tr::C_INFINITE, tr::C_ONE_HIT, tr::C_NO_TIME, tr::C_RING, tr::C_BIRD }),
+			[&] { return on_off(cfg.infinite_energy || cfg.one_hit_ko || cfg.no_time_limit || cfg.ring_cheat || cfg.jacky_bird); },
+			{}, [&] { menu.push(fight_page()); } });
 		heading(tr::C_SECRET_HEAD);
 		static const int SECRET[] = { 0, 9, 11, 12 };
 		static const char *SECRET_NAMES[] = { "Off", "Dural", "MUE", "KOJAC" };   // (the fighters' names as they are; Off the language's)
@@ -4357,7 +4403,10 @@ int main(int argc, char **argv)
 		});
 	};
 	online.adapter.run = [&](bool resim) {
-		m.set_draw_3d(!resim);   // (a frame run again after a rollback: the board alone, no picture)
+		// (a frame run again after a rollback: no picture of its own, but with scene sync its 3D set up, as every frame's
+		// offline: deferred, drawn only if shown, as the next frame's two frames late is. Not set up, the 3D shown after
+		// a rollback was the frames taken back's)
+		m.set_draw_3d(!resim || sync.enabled);
 		m.run_frame();
 		m.set_draw_3d(true);
 		if (resim) resimmed = true;
@@ -5328,6 +5377,10 @@ int main(int argc, char **argv)
 			m.m_in1 = ports[input_script::IN1] & ~live[1];
 			m.m_in2 = ports[input_script::IN2] & ~live[2];
 			m.m_sw = ports[input_script::SW];
+			// Cheats > Fight switches, into the game's RAM for the next frame: offline only (this loop isn't a match's,
+			// and never on a match's board, as Debug mode)
+			if (!g_match_board && !online.playing())   // (all off too: Ring back to Normal puts the game's width back)
+				m.fight_cheats(cfg.infinite_energy, cfg.one_hit_ko, cfg.no_time_limit, cfg.ring_cheat, cfg.jacky_bird);
 			auto [shot_first, shot_last] = script.shots.equal_range(game_frame);
 			for (auto it = shot_first; it != shot_last; ++it)
 				write_png(("build/host_" + it->second + ".png").c_str(), picture->data(), picture->width(), picture->height());
@@ -5342,6 +5395,13 @@ int main(int argc, char **argv)
 			game_frame++;
 			// (tests: the game's work RAM hashed every 30 frames, with the polygon counts it read, VF2_TEST_RAM_LOG=file: the game the same whatever the
 			// display's settings, Display > HUD's, V-Sync's, the frame limit's)
+			if (static const char *pk = getenv("VF2_TEST_POKE"); pk) {   // (tests: addr=byte@frame, a work RAM byte written once)
+				unsigned a = 0, v = 0; unsigned long long at = 0;
+				if (sscanf(pk, "%x=%x@%llu", &a, &v, &at) == 3 && game_frame == at && a < m.workram().size()) const_cast<std::vector<u8> &>(m.workram())[a] = u8(v);
+			}
+			if (static const char *rd = getenv("VF2_TEST_RAM_DUMP"); rd) {   // (tests: the work RAM to dir/ram_<frame>.bin every 10 frames)
+				if (game_frame % 10 == 0) if (FILE *f = fopen((std::string(rd) + "/ram_" + std::to_string(game_frame) + ".bin").c_str(), "wb")) { fwrite(m.workram().data(), 1, m.workram().size(), f); fclose(f); }
+			}
 			if (static FILE *rl = getenv("VF2_TEST_RAM_LOG") ? fopen(getenv("VF2_TEST_RAM_LOG"), "w") : nullptr; rl && game_frame % 30 == 0) {
 				fprintf(rl, "%llu %016llx %016llx\n", (unsigned long long)game_frame, (unsigned long long)fnv(m.workram().data(), m.workram().size()),
 					(unsigned long long)m.video().m_polygon_count_sum);   // (and every polygon count the game read from the 3D so far)
@@ -5389,8 +5449,16 @@ int main(int argc, char **argv)
 				step_carry = 0;
 				pace.emu += SDL_GetTicksNS() - te;
 				if (std::exchange(resimmed, false)) m.smooth_cut();   // (a rollback: the frames before aren't the ones shown)
-				draw_into_texture = true;
-				held = false;
+				// scene sync, as offline (frame_done): the 3D shown as MAME shows it while they fight, two frames late
+				// with the backdrop it was set for between, a scene's start held till it's whole. (It wasn't run in a
+				// match: the delay stayed as the last frame before it left it, two frames in a fight after the attract's
+				// demo, and the 3D shown late, after a rollback the frames taken back's)
+				if (m.newest_3d_cut()) pass_cut = true;
+				const bool show = sync.show(m);
+				if (show && !last_shown) m.smooth_cut();
+				last_shown = show;
+				draw_into_texture = show;
+				held = hold_on = !show;
 				m.m_audio_out.clear();
 				load.frames++;
 				game_frame++;
@@ -5487,7 +5555,10 @@ int main(int argc, char **argv)
 			smooth_budget = std::min(2.0, smooth_budget + double(bt - smooth_budget_t) * picture_cap / 1e9);
 			smooth_budget_t = bt;
 			const bool unseen = !hidden && (SDL_GetWindowFlags(win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED));
-			if (smooth_on() && !stopped && !ff && last_shown && !held && !unseen && (draw_into_texture || rec.on || (due == 0 && !took_ahead && smooth_budget >= 1))) {
+			// (in a match each frame as it is, when it's run, as VF1's and VF3's: 57.5 pictures a second. A picture
+			// between two frames a rollback may yet change showed the change as a ghost, and the in-betweens made Show
+			// FPS read the screen's rate, 120 on a 120 Hz screen)
+			if (smooth_on() && !online.playing() && !stopped && !ff && last_shown && !held && !unseen && (draw_into_texture || rec.on || (due == 0 && !took_ahead && smooth_budget >= 1))) {
 				smooth_now = true;
 				smooth_budget = std::max(0.0, smooth_budget - 1);
 				alpha = float(std::clamp(frame_clock - double(frames_run), 0.0, 1.0));

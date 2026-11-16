@@ -364,6 +364,13 @@ public:
 	// Start with P2 Guard held stops the game for its menu, held P2 Start shows it, P1's stick moves in it). Set before
 	// each frame while on; off, nothing (the game as ever). Offline only: never on an online match's board.
 	void set_debug_mode(bool on) { m_debug_mode = on; }
+	// Cheats > Fight switches (offline only: never called on a match's board): written into work RAM before each frame
+	// of a fight (game_mode() 9). infinite: bit 0 player 1's energy, bit 1 player 2's, kept full; one_hit: every other
+	// fighter's energy down to 1; no_time: the round's clock held at its start; ring: 0 the game's (put back if a cheat's
+	// was on), 1 tiny (650), 2 huge (5000: no ring outs), the width the round checks ring outs against. See model2a.cpp's fight_cheats
+	// bird: Jacky's stage's bird (the arcade's code, both players holding Start, Down and P+K+G): 0 as the arcade, 1 one
+	// player's code calls it, 2 it's called as each fight on the stage starts
+	void fight_cheats(int infinite, bool one_hit, bool no_time, int ring, int bird = 0);
 	bool debug_mode() const { return m_debug_mode; }
 	// Cheats' random fighters (random_fighter.cpp). Each player's fighter: "" the select as ever, "*" a random
 	// fighter, a new one each game, or a name's (as on its energy bar: a seed's, the same fighter on any machine).
@@ -443,7 +450,7 @@ public:
 	// never do), and the bytes for the sound board come from sound_bytes, a MIDI byte's time apart (320 us), as
 	// the UART would send them. From the next reset() (with set_sound(true)).
 	void set_sound_only(bool on) { m_sound_only = on; }
-	void sound_bytes(const uint8_t *b, size_t n) { m_snd_queue.insert(m_snd_queue.end(), b, b + n); }
+	void sound_bytes(const uint8_t *b, size_t n);
 	size_t sound_bytes_waiting() const { return m_snd_queue.size(); }
 	// The link to the sound board a byte at a time (for the host): each byte the UART sends reaches
 	// the sound board's MIDI input when its stop bit would be read there, and the UART's status
@@ -514,6 +521,7 @@ private:
 
 	// memory
 	std::vector<u8> m_ram200, m_workram, m_bufferram, m_backup, m_cpuctl;
+	float m_ring_own = 0; bool m_ring_own_kept = false;   // (fight_cheats: the ring's width the game set, for Normal again; offline only, not in a state)
 	std::vector<u16> m_palram, m_colorxlat, m_fbvram_a, m_fbvram_b;
 	std::vector<u32> m_tex0, m_tex1;
 	std::vector<u8> m_lumaram, m_m2comm_share;
@@ -615,6 +623,7 @@ private:
 	bool m_sound_only = false;
 	std::deque<uint8_t> m_snd_queue;   // (sound_only: the bytes to go to the sound board)
 	atime m_snd_next = 0;              // (and when the next may)
+	void snd_link_byte();              // (T_UART on a sound board alone: the next of them in)
 	float m_volume[2] = { 1, 1 };
 	float m_level = 1, m_limit = 1;   // set_level's gain; the limiter's gain now
 	bool m_backdrop_smooth = false;

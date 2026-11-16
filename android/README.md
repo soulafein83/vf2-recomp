@@ -142,10 +142,13 @@ network, or over a VPN, with no service in between; one side hosts, the other jo
 address and port. Both sides run the same game (the ROM's hash is checked) and the host's Rounds to
 win (vs player), 3 by default.
 
-The lobby — Online's rooms, room codes, Quick match, the count on its card and watching — needs
-libcurl, which Android doesn't ship, so this build carries no lobby address and those pages say so.
-Play by address is the way to play. A lobby can be built in with `.lobby-url` (one line, kept out of
-git) or `VF_LOBBY_URL` at build time, but it still needs libcurl at run time to reach it.
+The lobby — Online's rooms, room codes, Quick match, the count on its card and watching — works: the
+build pins **libcurl** and **mbedTLS** (`tools/android/deps.sh`), packs `libcurl.so` in the APK, and
+sets curl's CA path to Android's own trust store, so the phone talks to the lobby through the same
+`src/net` as the desktop. As on the desktop, the address is given at build time with `.lobby-url`
+(one line, kept out of git) or `VF_LOBBY_URL`; **this fork ships without one, so its APK carries no
+address and those pages say "no lobby"** — Play by address is the way to play. Upstream's own Android
+download (mr-finster's releases) is built with the official address in, and has the lobby.
 
 Online's settings (your name, delay, max ping, the match-found chime, Your fighter's random or seed
 fighter) are in the game's menu and kept in `settings.ini` like the rest.
@@ -159,14 +162,15 @@ filling the 108dp canvas, the letters inside the 66dp safe zone), which
 
 ## What is still owed
 
-The phone has run it (v1.1.4, upstream v0.1.22, on a Xiaomi 14T Pro, Dimensity 9300+, Mali-G720 MC12):
+The phone has run it (v1.1.5, upstream v0.1.23, on a Xiaomi 14T Pro, Dimensity 9300+, Mali-G720 MC12):
 `i960 native` (SLJIT's executable memory works), the GPU's 3D exact against the CPU's, the menu (Online
 included), the touches, Back, the immersive landscape window, the sound and the on-screen keyboard all
 work, and the board holds the game's 57.5 frames a second. The 13 languages' menus (Polish among them)
 and the Noto fonts for Japanese, Korean and Chinese draw; the menus are back to their full size with
-**Display in three pages** (Picture, Quality, Screen filter and colours) and the **free camera** (On
-hides the HUD and frees the camera; Off restores it); in all of it Online's rooms page, Quick match,
-Create room and Enter code say "no lobby" at once instead of waiting.
+**Display in three pages** (Picture, Quality, Screen filter and colours), the **free camera** (On hides
+the HUD and frees the camera; Off restores it) and, under **Cheats**, the v0.1.23 **Fight switches**
+(infinite energy, one-hit KO, no time limit, ring) and **Jacky's bird**; in all of it Online's rooms
+page, Quick match, Create room and Enter code say "no lobby" at once instead of waiting.
 
 Online's **Play by address** was played against a desktop build over the same network: the handshake, a
 match running on both sides (input delay 1, ping ~24 ms, 0 rollbacks, no desync over 8600 frames) and the
@@ -177,9 +181,9 @@ What is left:
 - The GPU's own 3D runs under the game's frame rate on a Dimensity 9300+, so **2x at full speed is the
   CPU 3D's**; at 5x/6x a 15-18 ms texture upload appears. During an online match the phone still holds
   57.5 frames/s at 4x.
-- The lobby — rooms, room codes, Quick match and watching — needs libcurl, which Android doesn't ship:
-  this build carries no lobby address (see **Online** above). mr-finster agreed (issue #36) to an Android
-  build using the official lobby; the code (pinned libcurl and mbedTLS, a CA bundle) is the next piece.
+- The lobby works in the phone build now (its own libcurl and mbedTLS), but this fork ships **no
+  address**: its APK plays by address and says "no lobby" (see **Online** above). The lobby code is
+  upstream since #37; mr-finster builds the official-address Android download for his releases.
 - The governor still walks the render scale down from 2x to 1x while the frames and pictures are whole:
   it costs sharpness and buys nothing.
 - Player 2 has no on-screen pad (a second gamepad or a keyboard plays them).
