@@ -1,0 +1,17 @@
+# Binaries / large assets
+*.bin
+*.cue
+*.iso
+*.z64
+*.ips
+*.zip
+*.mo
+*.o2r
+# Heavy/generated dirs
+.venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+Distribution/
+work/
+*.pyc
